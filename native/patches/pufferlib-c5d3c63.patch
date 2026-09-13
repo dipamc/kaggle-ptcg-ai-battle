@@ -1,0 +1,2693 @@
+--- a/src/pufferlib.cu
++++ b/src/pufferlib.cu
+@@ -23,6 +23,22 @@
+     LOSS_N = 7, NUM_LOSSES = 8,
+ };
+ 
++// LOCAL PATCH — guard buffer layout (docs/training.md).
++// MB_KL / MB_VF: this minibatch's mean approx-KL and value loss (written by
++// ppo_loss_reduce, rank-averaged in train_impl — adjacent so one 2-float
++// allreduce covers both). GATE: 1.0 = apply the muon step, 0.0 = veto it
++// (read inside muon's kernels). SKIPPED counts vetoed minibatches since the
++// last log (loss/kl_skipped); SKIPPED_VF counts the subset vetoed by the
++// value-loss test (loss/vf_skipped) — the critic-divergence signature fires
++// ~10 epochs before the policy KL moves (value 0.023 flat -> 0.5 -> 10 ->
++// 160+ while KL sits calm),
++// so the KL gate alone lets the critic destroy itself through open gates.
++enum KlGuardIdx {
++    KL_GUARD_MB_KL = 0, KL_GUARD_MB_VF = 1, KL_GUARD_GATE = 2,
++    KL_GUARD_SKIPPED = 3, KL_GUARD_SKIPPED_VF = 4,
++    KL_GUARD_SLOTS = 8,
++};
++
+ enum ProfileIdx {
+     PROF_ROLLOUT = 0,
+     PROF_EVAL_GPU,
+@@ -58,12 +74,13 @@
+     PrecisionTensor ratio;
+     PrecisionTensor importance;
+     PrecisionTensor action_mask;   // (horizon, agents, mask_size); .data=nullptr when env opts out
++    PrecisionTensor league_tag;    // (horizon, agents); .data=nullptr unless league routing
+ };
+ 
+ // Buffers are initialized as raw structs with only shape information. alloc_register
+ // stores the shape and data pointer. Memory is only allocated after all buffers are registered.
+ void register_rollout_buffers(RolloutBuf& bufs, Allocator* alloc, int T, int B, int input_size,
+-        int num_atns, int mask_size) {
++        int num_atns, int mask_size, int league) {
+     bufs = (RolloutBuf){
+         .observations = {.shape = {T, B, input_size}},
+         .actions      = {.shape = {T, B, num_atns}},
+@@ -87,6 +104,10 @@
+         bufs.action_mask = {.shape = {T, B, mask_size}};
+         alloc_register(alloc, &bufs.action_mask);
+     }
++    if (league) {
++        bufs.league_tag = {.shape = {T, B}};
++        alloc_register(alloc, &bufs.league_tag);
++    }
+ }
+ 
+ // Train data layout is transposed to (B, T) from rollouts layout (T, B)
+@@ -104,10 +125,11 @@
+     PrecisionTensor mb_newvalue;
+     PrecisionTensor mb_prio;        // (B,)
+     PrecisionTensor mb_action_mask; // (B, T, mask_size); .data=nullptr when disabled
++    PrecisionTensor mb_tag;         // (B, T) league tag; .data=nullptr when disabled
+ };
+ 
+ void register_train_buffers(TrainGraph& bufs, Allocator* alloc, int B, int T, int input_size,
+-        int hidden_size, int num_atns, int num_layers, int mask_size) {
++        int hidden_size, int num_atns, int num_layers, int mask_size, int league) {
+     bufs = (TrainGraph){
+         .mb_state =         {.shape = {num_layers, B, hidden_size}},
+         .mb_obs =           {.shape = {B, T, input_size}},
+@@ -135,6 +157,10 @@
+         bufs.mb_action_mask = {.shape = {B, T, mask_size}};
+         alloc_register(alloc, &bufs.mb_action_mask);
+     }
++    if (league) {
++        bufs.mb_tag = {.shape = {B, T}};
++        alloc_register(alloc, &bufs.mb_tag);
++    }
+ }
+ 
+ // PPO buffers + args are quite complex. We do the entire
+@@ -162,6 +188,10 @@
+     const int* act_sizes;
+     const precision_t* action_mask; // (N, T, A_total) or nullptr
+     int mask_stride_n, mask_stride_t;
++    // League: per-element frozen-actor tag (N, T) and the minibatch's learner
++    // element count (device scalar). nullptr outside league mode.
++    const precision_t* tag;
++    const float* learner_count;
+     const signed char* head_consume; // (nverbs, num_atns) or nullptr
+     int hc_stride;
+     int num_atns;
+@@ -189,7 +219,7 @@
+         .grad_logits = {.shape = {N, T, A_total}},
+         .grad_values = {.shape = {N, T, 1}},
+         .grad_logstd = {.shape = {N, T, A_total}},
+-        .adv_scratch = {.shape = {2}},
++        .adv_scratch = {.shape = {4}},   // var, mean, league learner count
+         .ent_coef = {.shape = {1}},
+     };
+     alloc_register(alloc, &bufs.loss_output);
+@@ -242,6 +272,11 @@
+     FloatTensor rewards;   // (total_agents,)
+     FloatTensor terminals; // (total_agents,)
+     ByteTensor action_mask; // (total_agents, mask_size); .data=nullptr when env opts out
++    // PTCG: mirror of the decoder output (all logits + the fused value column)
++    // that produced this step's actions, so the env can log the policy's
++    // distribution and value per decision. .data=nullptr unless the event log
++    // is on -- see StaticVec.dec_cols.
++    FloatTensor dec;
+ };
+ 
+ StaticVec* create_environments(int num_buffers, int total_agents,
+@@ -260,6 +295,12 @@
+     } else {
+         env.action_mask = { .data = nullptr, .shape = {0} };
+     }
++    if (vec->dec_cols > 0) {
++        env.dec = { .data = (float*)vec->gpu_dec,
++                    .shape = {total_agents, vec->dec_cols} };
++    } else {
++        env.dec = { .data = nullptr, .shape = {0} };
++    }
+     return vec;
+ }
+ 
+@@ -276,12 +317,30 @@
+     float lr;
+     float min_lr_ratio;
+     bool anneal_lr;
++    // LOCAL PATCH (docs/training.md): linear LR ramp over the first
++    // N epochs, composing with the anneal; 0 = off. Derived from the epoch
++    // counter, so resume mid-ramp continues at the right point.
++    int lr_warmup_epochs;
++    int lr_anneal_from_epoch;   // LOCAL PATCH: cosine anchor (0 = upstream)
++    // LOCAL PATCH: absolute epoch this run STARTED at (weights-only restarts
++    // carry the checkpoint's position via --start-step so telemetry, eval
++    // x-axes and epoch-driven schedules stay continuous with the parent
++    // run). The warmup ramp counts epochs RELATIVE to this, so a restart
++    // still ramps while prio-beta/cosine read the true absolute position.
++    int start_epoch;
+     // Optimizer
+     float beta1;
+     float beta2;
+     float eps;
+     // Training
+     int minibatch_size;
++    // LOCAL PATCH — gradient accumulation: micro-batches per optimizer step.
++    // Effective minibatch = minibatch_size * accum_minibatches at unchanged
++    // VRAM: each micro-batch's grads are folded into an accumulator at 1/k
++    // weight, so muon consumes exactly the big-batch mean gradient (NOT k
++    // times it — upstream's python accumulation steps on the raw sum).
++    // 1 = off, bit-identical to the pre-accum trainer.
++    int accum_minibatches;
+     float replay_ratio;
+     long total_timesteps;
+     float max_grad_norm;
+@@ -304,6 +363,23 @@
+     // Priority
+     float prio_alpha;
+     float prio_beta0;
++    // LOCAL PATCH — KL/value guard + Muon 1-D weight decay
++    // (docs/training.md). kl_skip_threshold <= 0 disables the
++    // per-minibatch KL test; vf_skip_threshold <= 0 disables the value-loss
++    // test (the critic ignites BEFORE the policy KL moves — measured);
++    // muon_wd_1d is decoupled weight decay on 1-D params only (upstream
++    // hardcodes 0.0 for everything).
++    float kl_skip_threshold;
++    float vf_skip_threshold;
++    float muon_wd_1d;
++    // LOCAL PATCH — league routing (docs/training.md).
++    // When set (and frozen banks exist), frozen banks stop owning whole rows:
++    // the primary forwards EVERY row, each frozen bank forwards its
++    // bank_layout slice into scratch, and a per-decision tag column in the
++    // obs (env_league_tag_col) selects whose action each row uses. The PPO
++    // loss masks frozen decisions out of pg/entropy/KL (value loss keeps
++    // them) and pins their importance ratio to 1. Requires 1 agent per env.
++    int league_routing;
+     // Flags
+     bool reset_state;
+     int cudagraphs;
+@@ -330,6 +406,12 @@
+     FloatTensor master_weights;
+     PrecisionTensor* buffer_states;         // [num_buffers]
+     PolicyActivations* buffer_activations;  // [num_buffers]
++    // League routing scratch: the bank samples into these instead of the
++    // rollout slots; a merge kernel then copies only the rows whose tag
++    // names this bank. NULL unless hypers.league_routing.
++    PrecisionTensor* scratch_act;           // [num_buffers] (slice, num_atns)
++    PrecisionTensor* scratch_lp;            // [num_buffers] (slice,)
++    PrecisionTensor* scratch_val;           // [num_buffers] (slice,) discarded
+     int slice_size;  // # agents per buffer this bank owns; sets activation/state batch dim
+     int hidden_size;
+     int num_layers;
+@@ -356,15 +438,23 @@
+     PrecisionTensor advantages_puf;  // Pre-allocated for train_impl (B, T)
+     cudaGraphExec_t* fused_rollout_cudagraphs;  // [horizon][num_buffers]
+     cudaGraphExec_t train_cudagraph;
++    // LOCAL PATCH — gradient accumulation: captured variant for NON-final
++    // micro-batches (fwd+bwd+accumulate; no guard, no muon, no reset).
++    cudaGraphExec_t train_accum_cudagraph;
+     cudaStream_t* streams;  // per-buffer raw CUDA streams
+     cudaStream_t default_stream;  // main-thread stream (captured once at init)
+     IntTensor act_sizes_puf;    // CUDA int32 tensor of action head sizes
+     FloatTensor losses_puf;     // (NUM_LOSSES,) f32 accumulator
++    FloatTensor kl_guard_puf;   // (KL_GUARD_SLOTS,) f32 — see KlGuardIdx
+     PPOBuffersPuf ppo_bufs_puf; // Pre-allocated buffers for ppo_loss_fwd_bwd
+     PrioBuffers prio_bufs;      // Pre-allocated buffers for prio_replay
+     FloatTensor master_weights;  // fp32 master weights (flat); same buffer as param_puf in fp32 mode
+     PrecisionTensor param_puf;
+     PrecisionTensor grad_puf;
++    // LOCAL PATCH — gradient accumulation arena. Same span/padded layout as
++    // grad_puf so muon's arena-offset walk applies unchanged; allocated only
++    // when hypers.accum_minibatches > 1, else .data stays NULL.
++    PrecisionTensor grad_accum_puf;
+     LongTensor rng_offset_puf;   // (num_buffers+1,) int64 CUDA device counters
+     ProfileT profile;
+     nvmlDevice_t nvml_device;
+@@ -376,6 +466,7 @@
+     int train_warmup;
+     bool rollout_captured;
+     bool train_captured;
++    bool train_accum_captured;  // LOCAL PATCH — accum-variant capture flag
+     ulong seed;
+     curandStatePhilox4_32_10_t** rng_states;  // per-buffer persistent RNG states [num_buffers]
+     // Optional frozen weight banks for match / league.
+@@ -388,12 +479,14 @@
+     // worker thread only writes inside its own physical chunk.
+     // Bank 0 = primary (learner). NULL = no layout set (primary owns full chunk).
+     int* bank_layout;
++    int league_tag_col;  // obs column of the league tag (league_routing only)
+ } PuffeRL;
+ 
+ Dict* log_environments_impl(PuffeRL& pufferl) {
+-    // Capacity raised from 32 to 64 to accommodate chess's per-bank
+-    // hist_score_bank_<b> / hist_n_bank_<b> entries (16 keys for 8 banks).
+-    Dict* out = create_dict(64);
++    // Capacity sized for per-bank league keys (ptcg: league_w_<b>/league_n_<b>
++    // for up to 16 banks on top of ~40 base keys) and chess's per-bank
++    // hist_score_bank_<b> / hist_n_bank_<b> entries.
++    Dict* out = create_dict(128);
+     static_vec_log(pufferl.vec, out);
+     return out;
+ }
+@@ -624,6 +717,41 @@
+     rng_states[idx] = state;
+ }
+ 
++// ---- league routing (opt-in via hypers.league_routing) ----
++// The env stamps a frozen-bank id (0 = learner) into one obs column on rows
++// where a frozen opponent is to act; the env exports which column via this
++// weak symbol (same pattern as env_head_consume_map).
++extern "C" __attribute__((weak)) int env_league_tag_col(void);
++
++// Pull the tag out of the observation into its own rollout tensor and zero
++// the column: every checkpoint trained with this column at 0, so no forward
++// (primary, frozen, or train) may see a nonzero value.
++__global__ void league_extract_tag_kernel(precision_t* __restrict__ obs,
++        precision_t* __restrict__ tag_out, int rows, int obs_size, int col) {
++    int i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= rows) return;
++    long o = (long)i * obs_size + col;
++    tag_out[i] = obs[o];
++    obs[o] = from_float(0.0f);
++}
++
++// Overwrite the rows this bank's tag claims with the bank's sampled action +
++// logprob. Values are deliberately NOT merged: the primary's critic prices
++// every row, so league games are mirror games with an external action source
++// (frozen critics never leak into GAE).
++__global__ void league_merge_kernel(precision_t* __restrict__ act,
++        precision_t* __restrict__ lp,
++        const precision_t* __restrict__ s_act,
++        const precision_t* __restrict__ s_lp,
++        const precision_t* __restrict__ tag, int bank_id, int n, int num_atns) {
++    int i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= n) return;
++    if ((int)(to_float(tag[i]) + 0.5f) != bank_id) return;
++    for (int h = 0; h < num_atns; h++)
++        act[(long)i * num_atns + h] = s_act[(long)i * num_atns + h];
++    lp[i] = s_lp[i];
++}
++
+ // Single step rollout forward pass. Called by each environment worker in their
+ // own buffer thread. This operation is cudagraphed.
+ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
+@@ -642,8 +770,13 @@
+ 
+     bool capturing = pufferl->epoch == hypers.cudagraphs;
+     if (capturing) {
+-        assert(cudaStreamBeginCapture(current_stream, cudaStreamCaptureModeGlobal) == cudaSuccess
+-                && "cudaStreamBeginCapture failed");
++        cudaError_t _e = cudaStreamBeginCapture(current_stream, cudaStreamCaptureModeThreadLocal);
++        if (_e != cudaSuccess) {
++            fprintf(stderr, "rollout BeginCapture failed: %s (stream=%p buf=%d t=%d)\n",
++                cudaGetErrorString(_e), (void*)current_stream, buf, t);
++            fprintf(stderr, "prior async error: %s\n", cudaGetErrorString(cudaGetLastError()));
++            abort();
++        }
+     }
+ 
+     RolloutBuf& rollouts = pufferl->rollouts;
+@@ -685,11 +818,27 @@
+     // [bank_layout[b], bank_layout[b+1]) within every buffer's chunk; layout is
+     // per-buffer-relative so each worker writes only inside its own chunk.
+     // Cudagraph capture absorbs the extra kernel launches.
++    //
++    // League mode instead has the primary forward EVERY row (league rows need
++    // the learner's action on its own seat's decisions and its value on all
++    // of them), while each frozen bank forwards its slice into scratch; a
++    // merge kernel then swaps in the frozen action/logprob on exactly the
++    // rows whose obs tag names that bank (the opponent seat's decisions).
+     int num_banks = 1 + pufferl->num_frozen_banks;
+     long act_cols = env.actions.shape[1];
++    bool league = pufferl->hypers.league_routing && pufferl->num_frozen_banks > 0
++                  && rollouts.league_tag.data != nullptr;
++    if (league) {
++        PrecisionTensor tag_t = puf_slice(rollouts.league_tag, t, start, block_size);
++        PrecisionTensor obs_t = puf_slice(rollouts.observations, t, start, block_size);
++        league_extract_tag_kernel<<<grid_size(block_size), BLOCK_SIZE, 0, stream>>>(
++            obs_t.data, tag_t.data, block_size, (int)rollouts.observations.shape[2],
++            pufferl->league_tag_col);
++    }
+     for (int b = 0; b < num_banks; b++) {
+         int bank_off = pufferl->bank_layout ? pufferl->bank_layout[b] : 0;
+         int bank_end = pufferl->bank_layout ? pufferl->bank_layout[b + 1] : block_size;
++        if (league && b == 0) { bank_off = 0; bank_end = block_size; }
+         int bank_size = bank_end - bank_off;
+         if (bank_size == 0) continue;
+ 
+@@ -715,6 +864,12 @@
+         PrecisionTensor act_b   = puf_slice(rollouts.actions,      t, sub_start, bank_size);
+         PrecisionTensor lp_b    = puf_slice(rollouts.logprobs,     t, sub_start, bank_size);
+         PrecisionTensor val_b   = puf_slice(rollouts.values,       t, sub_start, bank_size);
++        if (league && b > 0) {
++            WeightBank* fb = &pufferl->frozen_banks[b - 1];
++            act_b = fb->scratch_act[buf];
++            lp_b  = fb->scratch_lp[buf];
++            val_b = fb->scratch_val[buf];
++        }
+         PrecisionTensor mask_b  = {};
+         int mask_stride_b = 0;
+         if (rollouts.action_mask.data != nullptr) {
+@@ -724,9 +879,15 @@
+ 
+         PrecisionTensor dec_puf = policy_forward(p_bank, *w_bank, *a_bank, obs_b, *s_bank, stream);
+ 
++        // Only stock decoders carry a DecoderWeights struct. Custom decoders
++        // (ptcg's is an 8-byte stub) must not be type-punned: reading
++        // dw->continuous / dw->logstd there is heap garbage past the
++        // allocation — it can read 0 for the primary by luck and fault as
++        // soon as frozen-bank decoder stubs land in a different heap
++        // neighborhood. Gate on the env-level flag instead.
+         PrecisionTensor p_logstd = {};
+-        DecoderWeights* dw = (DecoderWeights*)w_bank->decoder;
+-        if (dw->continuous) {
++        if (pufferl->is_continuous) {
++            DecoderWeights* dw = (DecoderWeights*)w_bank->decoder;
+             p_logstd = dw->logstd;
+         }
+ 
+@@ -739,10 +900,38 @@
+             pufferl->rng_states[buf] + bank_off,
+             mask_b.data, mask_stride_b, hc_dev_s, hc_stride_s);
+ 
+-        cast<<<grid_size(numel(act_b.shape)), BLOCK_SIZE, 0, stream>>>(
+-                env.actions.data + (long)sub_start * act_cols,
+-                act_b.data, numel(act_b.shape));
++        // Mirror the decoder row the env will log against. Same rows the
++        // sampler just consumed, so it is the distribution the action was
++        // actually drawn from -- including for frozen-bank rows, whose logits
++        // are the ones that moved that seat. Plain kernel, so it captures into
++        // the rollout graph like everything else here.
++        if (env.dec.data != nullptr && dec_puf.shape[1] == env.dec.shape[1]) {
++            long dcols = env.dec.shape[1];
++            cast<<<grid_size(bank_size * dcols), BLOCK_SIZE, 0, stream>>>(
++                    env.dec.data + (long)sub_start * dcols,
++                    dec_puf.data, bank_size * dcols);
++        }
++
++        if (league && b > 0) {
++            PrecisionTensor ract = puf_slice(rollouts.actions,  t, sub_start, bank_size);
++            PrecisionTensor rlp  = puf_slice(rollouts.logprobs, t, sub_start, bank_size);
++            PrecisionTensor tagb = puf_slice(rollouts.league_tag, t, sub_start, bank_size);
++            league_merge_kernel<<<grid_size(bank_size), BLOCK_SIZE, 0, stream>>>(
++                ract.data, rlp.data, act_b.data, lp_b.data, tagb.data,
++                b, bank_size, (int)act_cols);
++        } else if (!league) {
++            cast<<<grid_size(numel(act_b.shape)), BLOCK_SIZE, 0, stream>>>(
++                    env.actions.data + (long)sub_start * act_cols,
++                    act_b.data, numel(act_b.shape));
++        }
+     }
++    if (league) {
++        // One cast for the whole block, after all merges landed.
++        PrecisionTensor act_all = puf_slice(rollouts.actions, t, start, block_size);
++        cast<<<grid_size(numel(act_all.shape)), BLOCK_SIZE, 0, stream>>>(
++                env.actions.data + (long)start * act_cols,
++                act_all.data, numel(act_all.shape));
++    }
+ 
+     if (capturing) {
+         cudaGraph_t _graph;
+@@ -856,12 +1045,23 @@
+ 
+     float adv_std = sqrtf(float(a.adv_var[0]));
+     float adv_normalized = (adv - float(a.adv_mean[0])) / (adv_std + 1e-8f);
++
++    // League: decisions acted by a frozen opponent train the critic but get
++    // no policy gradient, no entropy bonus, and no KL/clipfrac vote — their
++    // stored logprobs came from other weights, so the importance ratio is
++    // not an importance weight (it is pinned to 1 below so GAE treats these
++    // steps as env dynamics). Learner terms renormalize by the learner
++    // element count instead of N*T.
++    bool frz = (a.tag != nullptr) && (to_float(a.tag[nt]) > 0.5f);
++    float inv_L = (a.tag != nullptr)
++        ? 1.0f / fmaxf(a.learner_count[0], 1.0f) : inv_NT;
++    float pg_scale = frz ? 0.0f : inv_L;
+ 
+     // grad_loss is always 1.0 (set in post_create, never changes)
+     float dL = inv_NT;
+-    float d_pg_loss = dL;
++    float d_pg_loss = (a.tag == nullptr) ? dL : pg_scale;
+     float ent_coef = *a.ent_coef;
+-    float d_entropy_term = dL * (-ent_coef);
++    float d_entropy_term = ((a.tag == nullptr) ? dL : pg_scale) * (-ent_coef);
+ 
+     // Value loss (forward) + value gradient (backward)
+ 
+@@ -933,7 +1133,9 @@
+     // Shared pg loss computation
+     logratio = total_log_prob - old_logp;
+     ratio = __expf(logratio);
+-    g.out_ratio[nt] = from_float(ratio);
++    // Frozen decisions keep importance 1: a learner-vs-frozen ratio is not
++    // an importance weight (mirrors the torch trainer's ratio pinning).
++    g.out_ratio[nt] = from_float(frz ? 1.0f : ratio);
+     float ratio_clipped = fmaxf(1.0f - a.clip_coef, fminf(1.0f + a.clip_coef, ratio));
+     float wa = -w * adv_normalized;
+     float pg_loss1 = wa * ratio;
+@@ -947,6 +1149,9 @@
+         }
+     }
+     float d_new_logp = d_ratio * ratio;
++    // Frozen ratios can be inf (learner logprob of a frozen action), and
++    // 0 * inf = NaN — zero the pg gradient explicitly, not by scaling.
++    if (frz) d_new_logp = 0.0f;
+ 
+     if (!a.is_continuous) {
+         int logits_offset = 0;
+@@ -988,7 +1193,13 @@
+         }
+     }
+ 
+-    // Forward: loss partials
++    // Forward: loss partials. Outside league mode this is the upstream
++    // all-element mean, kept verbatim (bit-identical dormancy). In league
++    // mode every policy-side statistic averages over learner decisions only
++    // (frozen elements would otherwise poison approx-KL — and with it the
++    // KL skip gate — with meaningless learner-vs-frozen logratios); the
++    // value loss stays an all-element mean.
++    if (a.tag == nullptr) {
+     float thread_loss = (pg_loss + a.vf_coef * v_loss - ent_coef * total_entropy) * inv_NT;
+     block_losses[LOSS_PG][tid] = pg_loss * inv_NT;
+     block_losses[LOSS_VF][tid] = v_loss * inv_NT;
+@@ -997,6 +1208,21 @@
+     block_losses[LOSS_OLD_APPROX_KL][tid] = (-logratio) * inv_NT;
+     block_losses[LOSS_APPROX_KL][tid] = ((ratio - 1.0f) - logratio) * inv_NT;
+     block_losses[LOSS_CLIPFRAC][tid] = (fabsf(ratio - 1.0f) > a.clip_coef ? 1.0f : 0.0f) * inv_NT;
++    } else if (frz) {
++    // pg/ent/KL/clipfrac slots stay at their 0 initialization — writing
++    // value * 0 instead would turn an inf ratio into NaN.
++    block_losses[LOSS_VF][tid] = v_loss * inv_NT;
++    block_losses[LOSS_TOTAL][tid] = a.vf_coef * v_loss * inv_NT;
++    } else {
++    block_losses[LOSS_PG][tid] = pg_loss * inv_L;
++    block_losses[LOSS_VF][tid] = v_loss * inv_NT;
++    block_losses[LOSS_ENT][tid] = total_entropy * inv_L;
++    block_losses[LOSS_TOTAL][tid] = pg_loss * inv_L + a.vf_coef * v_loss * inv_NT
++                                    - ent_coef * total_entropy * inv_L;
++    block_losses[LOSS_OLD_APPROX_KL][tid] = (-logratio) * inv_L;
++    block_losses[LOSS_APPROX_KL][tid] = ((ratio - 1.0f) - logratio) * inv_L;
++    block_losses[LOSS_CLIPFRAC][tid] = (fabsf(ratio - 1.0f) > a.clip_coef ? 1.0f : 0.0f) * inv_L;
++    }
+     } // end if (idx < total_elements)
+ 
+ // Deterministic aggregation
+@@ -1022,9 +1248,13 @@
+ }
+ 
+ // Deterministic reduction of per-block PPO loss partials + count increment
++// LOCAL PATCH: guard_mb (nullable) additionally receives THIS minibatch's
++// mean approx-KL and mean value loss (overwritten every call, unlike the
++// accumulating losses_acc) so the guard can gate the muon step per minibatch.
+ __global__ void ppo_loss_reduce(
+         float* __restrict__ loss,
+         float* __restrict__ losses_acc,
++        float* __restrict__ guard_mb,
+         const float* __restrict__ partials,
+         int num_blocks) {
+     int tid = threadIdx.x;
+@@ -1041,6 +1271,10 @@
+         *loss += sum;
+     } else {
+         losses_acc[tid - 1] += sum;
++        if (guard_mb != nullptr) {
++            if (tid - 1 == LOSS_APPROX_KL) guard_mb[KL_GUARD_MB_KL] = sum;
++            if (tid - 1 == LOSS_VF) guard_mb[KL_GUARD_MB_VF] = sum;
++        }
+     }
+ 
+     // Fold add_scalar: increment epoch count
+@@ -1049,8 +1283,30 @@
+     }
+ }
+ 
++// LOCAL PATCH — the guard's gate decision (docs/training.md).
++// Runs once per minibatch, inside the captured train graph, AFTER the
++// minibatch KL/value-loss pair has been rank-averaged. Fails closed on
++// non-finite values: NaN compares false against any threshold, so the
++// finiteness test is what stops a fully-diverged minibatch from sailing
++// through. A threshold <= 0 disables that test.
++__global__ void kl_gate_kernel(float* __restrict__ guard,
++        float kl_threshold, float vf_threshold) {
++    float kl = guard[KL_GUARD_MB_KL];
++    float vf = guard[KL_GUARD_MB_VF];
++    bool kl_ok = (kl_threshold <= 0.0f) || (isfinite(kl) && kl <= kl_threshold);
++    bool vf_ok = (vf_threshold <= 0.0f) || (isfinite(vf) && vf <= vf_threshold);
++    float pass = (kl_ok && vf_ok) ? 1.0f : 0.0f;
++    guard[KL_GUARD_GATE] = pass;
++    guard[KL_GUARD_SKIPPED] += 1.0f - pass;
++    guard[KL_GUARD_SKIPPED_VF] += (!vf_ok) ? 1.0f : 0.0f;
++}
++
++// var/mean of the minibatch advantages; when tag != nullptr additionally
++// counts the learner (tag < 0.5) elements into *count_out — the pg/entropy
++// normalizer in league mode.
+ __global__ void ppo_var_mean(const precision_t* __restrict__ src,
+-        float* __restrict__ var_out, float* __restrict__ mean_out, int n) {
++        float* __restrict__ var_out, float* __restrict__ mean_out, int n,
++        const precision_t* __restrict__ tag, float* __restrict__ count_out) {
+     __shared__ float sdata[256];
+     int tid = threadIdx.x;
+     float sum = 0.0f;
+@@ -1085,6 +1341,24 @@
+     }
+     if (tid == 0) {
+         *var_out = sdata[0] / (float)(n - 1);
++    }
++    if (tag != nullptr) {
++        __syncthreads();
++        float cnt = 0.0f;
++        for (int i = tid; i < n; i += blockDim.x) {
++            cnt += (to_float(tag[i]) < 0.5f) ? 1.0f : 0.0f;
++        }
++        sdata[tid] = cnt;
++        __syncthreads();
++        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
++            if (tid < s) {
++                sdata[tid] += sdata[tid + s];
++            }
++            __syncthreads();
++        }
++        if (tid == 0) {
++            *count_out = sdata[0];
++        }
+     }
+ }
+ 
+@@ -1096,6 +1370,7 @@
+         PrecisionTensor& logstd,     // continuous logstd or empty
+         TrainGraph& graph,
+         IntTensor& act_sizes, FloatTensor& losses_acc,
++        float* guard_mb,             // LOCAL PATCH: guard buffer base for per-minibatch KL/vf (nullable)
+         float clip_coef, float vf_clip_coef, float vf_coef, const float* ent_coef,
+         PPOBuffersPuf& bufs, bool is_continuous,
+         cudaStream_t stream) {
+@@ -1108,8 +1383,11 @@
+ 
+     float* adv_var_ptr = bufs.adv_scratch.data;
+     float* adv_mean_ptr = adv_var_ptr + 1;
++    float* lcount_ptr = adv_var_ptr + 2;
++    bool has_tag = (graph.mb_tag.data != nullptr);
+     ppo_var_mean<<<1, 256, 0, stream>>>(
+-        graph.mb_advantages.data, adv_var_ptr, adv_mean_ptr, numel(graph.mb_advantages.shape));
++        graph.mb_advantages.data, adv_var_ptr, adv_mean_ptr, numel(graph.mb_advantages.shape),
++        has_tag ? graph.mb_tag.data : nullptr, has_tag ? lcount_ptr : nullptr);
+ 
+     int ppo_grid = (total + PPO_THREADS - 1) / PPO_THREADS;
+ 
+@@ -1151,6 +1429,8 @@
+         .action_mask = has_mask ? graph.mb_action_mask.data : nullptr,
+         .mask_stride_n = has_mask ? T * A_total : 0,
+         .mask_stride_t = has_mask ? A_total : 0,
++        .tag = has_tag ? graph.mb_tag.data : nullptr,
++        .learner_count = has_tag ? lcount_ptr : nullptr,
+         .head_consume = hc_dev_l,
+         .hc_stride = hc_stride_l,
+         .num_atns = (int)numel(act_sizes.shape),
+@@ -1165,7 +1445,7 @@
+     ppo_loss_compute<<<ppo_grid, PPO_THREADS, 0, stream>>>(ppo_partials_buf, args, graph_args);
+ 
+     ppo_loss_reduce<<<1, LOSS_N + 1, 0, stream>>>(
+-        bufs.loss_output.data, losses_acc.data, ppo_partials_buf, ppo_grid);
++        bufs.loss_output.data, losses_acc.data, guard_mb, ppo_partials_buf, ppo_grid);
+ }
+ 
+ #define PRIO_WARP_SIZE 32
+@@ -1535,6 +1815,13 @@
+                        (char*)graph.mb_action_mask.data, src_row, mb, mask_row_bytes);
+         }
+         break;
++    case 6:
++        if (graph.mb_tag.data != nullptr && rollouts.league_tag.data != nullptr) {
++            int tag_row_bytes = rollouts.league_tag.shape[1] * (int)sizeof(precision_t);
++            copy_bytes((const char*)rollouts.league_tag.data,
++                       (char*)graph.mb_tag.data, src_row, mb, tag_row_bytes);
++        }
++        break;
+     }
+ }
+ 
+@@ -1545,6 +1832,18 @@
+     return lr_min + 0.5f*(lr_base - lr_min)*(1.0f + std::cos(M_PI * ratio));
+ }
+ 
++// LOCAL PATCH — gradient accumulation: acc += grad * inv_k, run after each
++// micro-batch's backward. grad_puf is fully rewritten by every backward (the
++// model zeroes the param-grad span first, then atomicAdds), so after k
++// micro-batches acc holds exactly the mean gradient of the effective
++// (k * minibatch) batch. Elementwise over the padded arena — alignment-gap
++// floats are zero on both sides and stay zero.
++__global__ void accum_grads_kernel(precision_t* __restrict__ acc,
++        const precision_t* __restrict__ grad, float inv_k, int n) {
++    int i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i < n) acc[i] = from_float(to_float(acc[i]) + to_float(grad[i]) * inv_k);
++}
++
+ void train_impl(PuffeRL& pufferl) {
+     // Update to HypersT& p
+     HypersT& hypers = pufferl.hypers;
+@@ -1580,6 +1879,10 @@
+         transpose_102<<<grid_size(T*B*mask_size), BLOCK_SIZE, 0, train_stream>>>(
+             rollouts.action_mask.data, src.action_mask.data, T, B, mask_size);
+     }
++    if (src.league_tag.data != nullptr) {
++        transpose_102<<<grid_size(T*B), BLOCK_SIZE, 0, train_stream>>>(
++            rollouts.league_tag.data, src.league_tag.data, T, B, 1);
++    }
+ 
+     // We hard-clamp rewards to -1, 1. Our envs are mostly designed to respect this range
+     clamp_precision_kernel<<<grid_size(numel(rollouts.rewards.shape)), BLOCK_SIZE, 0, train_stream>>>(
+@@ -1600,9 +1903,33 @@
+ 
+     Muon* muon = &pufferl.muon;
+     int total_epochs = hypers.total_timesteps / batch_size;
+-    if (anneal_lr) {
+-        float lr_min = hypers.min_lr_ratio * hypers.lr;
+-        float lr = cosine_annealing(hypers.lr, lr_min, current_epoch, total_epochs);
++    // LOCAL PATCH (docs/training.md): the memcpy is hoisted out of
++    // the anneal branch — on flat runs (--no-anneal-lr) this is the ONLY
++    // write to lr_ptr after init, so a warmup gated behind
++    // anneal_lr would silently no-op on exactly the runs it is meant for.
++    // Warmup multiplies AFTER the anneal so the two compose; epoch+1 so the
++    // first epoch is not a wasted 0.0-LR pass.
++    {
++        float lr = hypers.lr;
++        if (anneal_lr) {
++            float lr_min = hypers.min_lr_ratio * hypers.lr;
++            // LOCAL PATCH: anchor the cosine at lr_anneal_from_epoch (0 =
++            // upstream behaviour). Turning annealing on MID-RUN with the
++            // epoch-0 anchor rides the steep middle of a curve that started
++            // before this run existed: it matches the endpoints but not the
++            // shape (e.g. 0.00045 vs 0.0006 at the midpoint). Anchoring
++            // makes "cosine from HERE to the target" mean
++            // what it says.
++            long t = (long)current_epoch - (long)hypers.lr_anneal_from_epoch;
++            long T = (long)total_epochs - (long)hypers.lr_anneal_from_epoch;
++            if (t < 0) t = 0;
++            if (T < 1) T = 1;
++            lr = cosine_annealing(hypers.lr, lr_min, t, T);
++        }
++        if (hypers.lr_warmup_epochs > 0) {
++            int ramp_epoch = current_epoch - hypers.start_epoch;
++            lr *= fminf(1.0f, (float)(ramp_epoch + 1) / (float)hypers.lr_warmup_epochs);
++        }
+         cudaMemcpy(muon->lr_ptr, &lr, sizeof(float), cudaMemcpyHostToDevice);
+     }
+ 
+@@ -1626,15 +1953,33 @@
+     cudaEventRecord(pufferl.profile.events[1]);  // pre-loop end
+ 
+     int total_minibatches = hypers.replay_ratio * batch_size / hypers.minibatch_size;
++    // LOCAL PATCH — gradient accumulation group size (1 = off). Groups must
++    // tile the epoch exactly or the last partial group would never step.
++    int accum_k = hypers.accum_minibatches > 1 ? hypers.accum_minibatches : 1;
++    if (accum_k > 1 && total_minibatches % accum_k != 0) {
++        fprintf(stderr, "FATAL: total_minibatches %d not divisible by "
++                "accum_minibatches %d\n", total_minibatches, accum_k);
++        abort();
++    }
+     for (int mb = 0; mb < total_minibatches; ++mb) {
+         cudaEventRecord(pufferl.profile.events[2]);  // start of misc (overwritten each iter)
+         puf_zero(&advantages_puf, train_stream);
+ 
+         profile_begin("compute_advantage", hypers.profile);
++#ifdef PTCG_NATIVE
++        ptcg_puff_advantage(&rollouts.values, &rollouts.rewards,
++            &rollouts.terminals, &rollouts.ratio, &rollouts.observations,
++            &advantages_puf, hypers.gamma, hypers.gae_lambda,
++            hypers.vtrace_rho_clip, hypers.vtrace_c_clip, train_stream);
++#else
+         puff_advantage_cuda(rollouts.values, rollouts.rewards, rollouts.terminals,
+             rollouts.ratio, advantages_puf, hypers.gamma, hypers.gae_lambda,
+             hypers.vtrace_rho_clip, hypers.vtrace_c_clip, train_stream);
+-        if (pufferl.num_frozen_banks > 0 && pufferl.bank_layout != NULL) {
++#endif
++        // League mode replaces per-row advantage zeroing (rows there mix
++        // learner and frozen decisions; the PPO kernel masks per element).
++        if (pufferl.num_frozen_banks > 0 && pufferl.bank_layout != NULL
++                && !hypers.league_routing) {
+             int apb = hypers.total_agents / hypers.num_buffers;
+             zero_frozen_advantages_cuda(advantages_puf, apb,
+                 pufferl.bank_layout[1], train_stream);
+@@ -1655,7 +2000,8 @@
+             RolloutBuf sel_src = rollouts;
+             sel_src.values = rollouts.values;
+             int mb_segs = pufferl.prio_bufs.idx.shape[0];
+-            int channels = (graph.mb_action_mask.data != nullptr) ? 6 : 5;
++            int channels = (graph.mb_tag.data != nullptr) ? 7
++                         : (graph.mb_action_mask.data != nullptr) ? 6 : 5;
+             select_copy<<<dim3(mb_segs, channels), SELECT_COPY_THREADS, 0, train_stream>>>(
+                 sel_src, graph, pufferl.prio_bufs.idx.data,
+                 advantages_puf.data, pufferl.prio_bufs.mb_prio.data);
+@@ -1664,12 +2010,26 @@
+ 
+         cudaEventRecord(pufferl.profile.events[3]);  // end misc / start forward
+         profile_begin("train_forward_backward", hypers.profile);
+-        if (pufferl.train_captured) {
+-            cudaGraphLaunch(pufferl.train_cudagraph, train_stream);
++        // LOCAL PATCH — gradient accumulation: guard, muon and the
++        // accumulator reset run only on each group's FINAL micro-batch, so
++        // the captured work differs by position within the group. Two graph
++        // variants cover the two shapes; accum_k == 1 always takes the step
++        // variant, which is the pre-accum graph unchanged.
++        bool is_step_mb = (accum_k == 1) || ((mb + 1) % accum_k == 0);
++        bool variant_captured = is_step_mb ? pufferl.train_captured
++                                           : pufferl.train_accum_captured;
++        if (variant_captured) {
++            cudaGraphLaunch(is_step_mb ? pufferl.train_cudagraph
++                                       : pufferl.train_accum_cudagraph,
++                            train_stream);
+         } else {
+-            bool capturing = pufferl.train_warmup == hypers.cudagraphs;
++            // >= instead of ==: with two variants the second one to occur
++            // captures one minibatch after the threshold. cudagraphs < 0
++            // must still mean "never capture".
++            bool capturing = hypers.cudagraphs >= 0
++                && pufferl.train_warmup >= hypers.cudagraphs;
+             if (capturing) {
+-                assert(cudaStreamBeginCapture(train_stream, cudaStreamCaptureModeGlobal) == cudaSuccess
++                assert(cudaStreamBeginCapture(train_stream, cudaStreamCaptureModeThreadLocal) == cudaSuccess
+                         && "cudaStreamBeginCapture failed");
+             }
+ 
+@@ -1677,14 +2037,19 @@
+             PrecisionTensor obs_puf = graph.mb_obs;
+             PrecisionTensor state_puf = graph.mb_state;
+             PrecisionTensor dec_puf = policy_forward_train(&pufferl.policy, pufferl.weights, pufferl.train_activations, obs_puf, state_puf, stream);
+-            DecoderWeights* dw_train = (DecoderWeights*)pufferl.weights.decoder;
+-            PrecisionTensor p_logstd;
+-            if (dw_train->continuous) {
++            // Same custom-decoder pun hazard as the rollout path: only read
++            // DecoderWeights through the env-level continuous flag.
++            PrecisionTensor p_logstd = {};
++            if (pufferl.is_continuous) {
++                DecoderWeights* dw_train = (DecoderWeights*)pufferl.weights.decoder;
+                 p_logstd = dw_train->logstd;
+             }
+ 
++            bool kl_guard_on = hypers.kl_skip_threshold > 0.0f
++                || hypers.vf_skip_threshold > 0.0f;
+             ppo_loss_fwd_bwd(dec_puf, p_logstd, graph,
+                 pufferl.act_sizes_puf, pufferl.losses_puf,
++                kl_guard_on ? pufferl.kl_guard_puf.data : nullptr,
+                 hypers.clip_coef, hypers.vf_clip_coef, hypers.vf_coef,
+                 pufferl.ppo_bufs_puf.ent_coef.data,
+                 pufferl.ppo_bufs_puf, pufferl.is_continuous, stream);
+@@ -1695,21 +2060,83 @@
+             policy_backward(&pufferl.policy, pufferl.weights, pufferl.train_activations,
+                 grad_logits_puf, grad_logstd_puf, grad_values_puf, stream);
+ 
+-            muon_step(&pufferl.muon, pufferl.master_weights, pufferl.grad_puf, hypers.max_grad_norm, stream);
+-            if (USE_BF16) {
+-                int n = numel(pufferl.param_puf.shape);
+-                cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
+-                    pufferl.param_puf.data, pufferl.master_weights.data, n);
++            // LOCAL PATCH — gradient accumulation: fold this micro-batch's
++            // grads into the accumulator at 1/k weight.
++            if (accum_k > 1) {
++                int gn = (int)numel(pufferl.grad_puf.shape);
++                accum_grads_kernel<<<grid_size(gn), BLOCK_SIZE, 0, stream>>>(
++                    pufferl.grad_accum_puf.data, pufferl.grad_puf.data,
++                    1.0f / (float)accum_k, gn);
+             }
++
++            // LOCAL PATCH — guard (docs/training.md): average
++            // this minibatch's approx-KL and value loss across ranks, then
++            // set the gate the muon kernels read. The allreduce is mandatory
++            // under DDP: grads are averaged but updates apply rank-locally,
++            // so a per-rank skip decision would fork the ranks' weights
++            // permanently. All of this is device-side and stream-ordered, so
++            // it captures into the train cudagraph like the grad allreduce
++            // already does. The guard buffer is a FloatTensor -> ncclFloat,
++            // NOT NCCL_PRECISION; MB_KL/MB_VF are adjacent so one 2-float
++            // allreduce covers both.
++            // (accum: the gate decision belongs to the optimizer step, so
++            // the guard allreduce+gate run only on the group's final micro —
++            // MB_KL/MB_VF then hold that micro's estimate, same statistic
++            // quality as the plain per-minibatch test. SKIPPED counts vetoed
++            // optimizer STEPS, i.e. groups, when accumulation is on.)
++            if (kl_guard_on && is_step_mb) {
++                float* mb_ptr = pufferl.kl_guard_puf.data + KL_GUARD_MB_KL;
++                if (pufferl.nccl_comm != nullptr && hypers.world_size > 1) {
++                    ncclAllReduce(mb_ptr, mb_ptr, 2, ncclFloat, ncclAvg,
++                        pufferl.nccl_comm, stream);
++                }
++                kl_gate_kernel<<<1, 1, 0, stream>>>(
++                    pufferl.kl_guard_puf.data, hypers.kl_skip_threshold,
++                    hypers.vf_skip_threshold);
++            }
++
++            if (is_step_mb) {
++                // LOCAL PATCH — the optimizer consumes the accumulated mean
++                // gradient when accumulation is on; muon's internal allreduce
++                // (ncclAvg) and norm clip then see exactly the big-batch
++                // gradient.
++                muon_step(&pufferl.muon, pufferl.master_weights,
++                    accum_k > 1 ? pufferl.grad_accum_puf : pufferl.grad_puf,
++                    hypers.max_grad_norm, stream);
++                if (USE_BF16) {
++                    int n = numel(pufferl.param_puf.shape);
++                    cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
++                        pufferl.param_puf.data, pufferl.master_weights.data, n);
++                }
++                if (accum_k > 1) {
++                    // Reset the accumulator for the next group (a memset
++                    // node inside the captured step graph).
++                    cudaMemsetAsync(pufferl.grad_accum_puf.data, 0,
++                        numel(pufferl.grad_accum_puf.shape) * sizeof(precision_t),
++                        stream);
++                }
++            }
+             if (capturing) {
+                 cudaGraph_t _graph;
+                 assert(cudaStreamEndCapture(train_stream, &_graph) == cudaSuccess
+                         && "cudaStreamEndCapture failed");
+-                assert(cudaGraphInstantiate(&pufferl.train_cudagraph, _graph, 0) == cudaSuccess
++                cudaGraphExec_t* exec = is_step_mb ? &pufferl.train_cudagraph
++                                                   : &pufferl.train_accum_cudagraph;
++                assert(cudaGraphInstantiate(exec, _graph, 0) == cudaSuccess
+                         && "cudaGraphInstantiate failed");
+                 assert(cudaGraphDestroy(_graph) == cudaSuccess && "cudaGraphDestroy failed");
+                 cudaDeviceSynchronize();
+-                pufferl.train_captured = true;
++                if (is_step_mb) pufferl.train_captured = true;
++                else pufferl.train_accum_captured = true;
++                // Stream capture RECORDS the work above without executing it
++                // (upstream accepts losing that one update at capture). With
++                // accumulation that would also desync the accumulator across
++                // the group, so execute the just-captured graph once — the
++                // recorded micro then behaves exactly like a normal one.
++                // accum_k == 1 keeps the upstream behaviour untouched.
++                if (accum_k > 1) {
++                    cudaGraphLaunch(*exec, train_stream);
++                }
+             }
+             pufferl.train_warmup++;
+         }
+@@ -1735,7 +2162,14 @@
+     }
+     pufferl.epoch += 1;
+ 
+-    cudaStreamSynchronize(pufferl.default_stream);
++    {
++        cudaError_t te = cudaStreamSynchronize(pufferl.default_stream);
++        if (te != cudaSuccess) {
++            fprintf(stderr, "FATAL: train end-sync epoch %ld: %s\n",
++                    pufferl.epoch, cudaGetErrorString(te));
++            abort();
++        }
++    }
+ 
+     if (total_minibatches > 0) {
+         float ms;
+@@ -1799,6 +2233,7 @@
+         .free_activations = mingru_free_activations,
+         .hidden = hidden_size, .num_layers = num_layers, .horizon = horizon,
+     };
++    create_custom_network(env_name, &network);
+     return Policy{
+         .encoder = encoder, .decoder = decoder, .network = network,
+         .input_dim = input_size, .hidden_dim = hidden_size, .output_dim = decoder_output_size,
+@@ -1837,16 +2272,31 @@
+         bank->buffer_states[i] = {.shape = {num_layers, slice_size, hidden_size}};
+         alloc_register(acts, &bank->buffer_states[i]);
+     }
++    if (pufferl->hypers.league_routing) {
++        bank->scratch_act = (PrecisionTensor*)calloc(num_buffers, sizeof(PrecisionTensor));
++        bank->scratch_lp = (PrecisionTensor*)calloc(num_buffers, sizeof(PrecisionTensor));
++        bank->scratch_val = (PrecisionTensor*)calloc(num_buffers, sizeof(PrecisionTensor));
++        for (int i = 0; i < num_buffers; i++) {
++            bank->scratch_act[i] = {.shape = {slice_size, num_action_heads}};
++            alloc_register(acts, &bank->scratch_act[i]);
++            bank->scratch_lp[i] = {.shape = {slice_size}};
++            alloc_register(acts, &bank->scratch_lp[i]);
++            bank->scratch_val[i] = {.shape = {slice_size}};
++            alloc_register(acts, &bank->scratch_val[i]);
++        }
++    }
+ 
+     alloc_create(params);
+     alloc_create(acts);
+ 
+-    bank->param_puf = {.data = (precision_t*)params->mem, .shape = {params->total_elems}};
++    long bank_span = params->total_bytes / (long)sizeof(precision_t);
++    bank->param_puf = {.data = (precision_t*)params->mem, .shape = {bank_span}};
+     if (USE_BF16) {
+-        bank->master_weights = {.shape = {params->total_elems}};
+-        cudaMalloc(&bank->master_weights.data, params->total_elems * sizeof(float));
++        bank->master_weights = {.shape = {params->total_bytes / (long)sizeof(float)}};
++        cudaMalloc(&bank->master_weights.data, params->total_bytes);
+     } else {
+-        bank->master_weights = {.data = (float*)bank->param_puf.data, .shape = {params->total_elems}};
++        bank->master_weights = {.data = (float*)bank->param_puf.data,
++                                .shape = {params->total_bytes / (long)sizeof(float)}};
+     }
+ }
+ 
+@@ -1863,6 +2313,9 @@
+         free(bank->buffer_activations);
+     }
+     free(bank->buffer_states);
++    free(bank->scratch_act);   // arena memory freed with acts_alloc below
++    free(bank->scratch_lp);
++    free(bank->scratch_val);
+     alloc_free(&bank->params_alloc);
+     alloc_free(&bank->acts_alloc);
+     if (USE_BF16 && bank->master_weights.data != NULL) {
+@@ -1905,6 +2358,37 @@
+     return idx;
+ }
+ 
++// ---- packed weight blob <-> aligned arena image -------------------------
++// On-disk weight blobs are PACKED fp32 in registration order (torch-converter
++// format, sum-of-numel elements). Arenas 16B-align each tensor, so staging
++// goes through a host-side image of the arena layout. The offset rule here
++// MUST mirror alloc_create's.
++static void packed_blob_to_arena_host(Allocator* a, const float* packed,
++        float* arena_img) {
++    long off = 0, poff = 0;
++    for (int i = 0; i < a->num_regs; i++) {
++        assert(a->regs[i].elem_size == (int)sizeof(float));
++        off = (off + 3) & ~3L;
++        long ne = numel(a->regs[i].shape);
++        memcpy(arena_img + off, packed + poff, ne * sizeof(float));
++        off += ne;
++        poff += ne;
++    }
++}
++
++static void arena_host_to_packed_blob(Allocator* a, const float* arena_img,
++        float* packed) {
++    long off = 0, poff = 0;
++    for (int i = 0; i < a->num_regs; i++) {
++        assert(a->regs[i].elem_size == (int)sizeof(float));
++        off = (off + 3) & ~3L;
++        long ne = numel(a->regs[i].shape);
++        memcpy(packed + poff, arena_img + off, ne * sizeof(float));
++        off += ne;
++        poff += ne;
++    }
++}
++
+ // Load a frozen bank's weights from a file (same format as save_weights — flat fp32).
+ // Safe to call between rollouts (in-place cudaMemcpy; cudagraphs hold the pointer,
+ // not a copy of the data).
+@@ -1914,7 +2398,8 @@
+         return;
+     }
+     WeightBank* bank = &pufferl->frozen_banks[bank_idx];
+-    int64_t nbytes = numel(bank->master_weights.shape) * sizeof(float);
++    int64_t packed_bytes = bank->params_alloc.total_elems * sizeof(float);
++    int64_t arena_bytes = numel(bank->master_weights.shape) * sizeof(float);
+     FILE* f = fopen(path, "rb");
+     if (!f) {
+         fprintf(stderr, "pufferl_load_frozen_bank: failed to open %s\n", path);
+@@ -1923,20 +2408,22 @@
+     fseek(f, 0, SEEK_END);
+     long file_size = ftell(f);
+     fseek(f, 0, SEEK_SET);
+-    if (file_size != nbytes) {
++    if (file_size != packed_bytes) {
+         fprintf(stderr, "pufferl_load_frozen_bank: size mismatch (expected %lld, got %ld)\n",
+-            (long long)nbytes, file_size);
++            (long long)packed_bytes, file_size);
+         fclose(f);
+         return;
+     }
+-    std::vector<char> buf(nbytes);
+-    size_t nread = fread(buf.data(), 1, nbytes, f);
++    std::vector<float> packed(bank->params_alloc.total_elems);
++    size_t nread = fread(packed.data(), 1, packed_bytes, f);
+     fclose(f);
+-    if ((int64_t)nread != nbytes) {
++    if ((int64_t)nread != packed_bytes) {
+         fprintf(stderr, "pufferl_load_frozen_bank: short read on %s\n", path);
+         return;
+     }
+-    cudaMemcpy(bank->master_weights.data, buf.data(), nbytes, cudaMemcpyHostToDevice);
++    std::vector<float> arena_img(arena_bytes / sizeof(float), 0.0f);
++    packed_blob_to_arena_host(&bank->params_alloc, packed.data(), arena_img.data());
++    cudaMemcpy(bank->master_weights.data, arena_img.data(), arena_bytes, cudaMemcpyHostToDevice);
+     if (USE_BF16) {
+         int n = numel(bank->param_puf.shape);
+         cast<<<grid_size(n), BLOCK_SIZE, 0, pufferl->default_stream>>>(
+@@ -1980,6 +2467,29 @@
+     return static_vec_count_aligned(pufferl->vec, tag_value, reset_flags);
+ }
+ 
++// Reduce one int across the ranks. op: 0 = min, 1 = max, 2 = sum.
++// Exists so python can PROVE the ranks agree before doing something that must
++// happen identically everywhere -- specifically the mid-run deck-pool swap,
++// where ranks disagreeing means deck id 57 is a different deck on different
++// ranks and both the training data and the deck matrix corrupt with no error.
++// Single-rank runs short-circuit, so callers need no world_size special-case.
++extern "C" int pufferl_allreduce_i32(PuffeRL* pufferl, int value, int op) {
++    if (pufferl->nccl_comm == nullptr || pufferl->hypers.world_size <= 1)
++        return value;
++    int* dev = nullptr;
++    if (cudaMalloc(&dev, sizeof(int)) != cudaSuccess) return value;
++    cudaMemcpy(dev, &value, sizeof(int), cudaMemcpyHostToDevice);
++    ncclRedOp_t o = (op == 0) ? ncclMin : (op == 1) ? ncclMax : ncclSum;
++    ncclResult_t nr = ncclAllReduce(dev, dev, 1, ncclInt32, o,
++                                    pufferl->nccl_comm, 0);
++    cudaStreamSynchronize(0);
++    int out = value;
++    if (nr == ncclSuccess)
++        cudaMemcpy(&out, dev, sizeof(int), cudaMemcpyDeviceToHost);
++    cudaFree(dev);
++    return out;
++}
++
+ extern "C" int pufferl_num_envs(PuffeRL* pufferl) {
+     return pufferl->vec->size;
+ }
+@@ -1992,6 +2502,21 @@
+     pufferl->default_stream = 0;
+     pufferl->env_name = env_name;
+ 
++    // PTCG: on quota'd cloud slices, spin-polling syncs (CUDA's default here:
++    // few contexts vs many logical cores => Auto resolves to spin) burn cores
++    // during allreduce/stream waits. Blocking sync sleeps instead; wake latency
++    // is ~10-20us per sync, invisible next to multi-second phases. Opt out
++    // with PTCG_BLOCKING_SYNC=0. Must run before this process's context exists.
++    const char* pbs = getenv("PTCG_BLOCKING_SYNC");
++    if (pbs == nullptr || pbs[0] != '0') {
++        cudaError_t fe = cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
++        if (fe != cudaSuccess) {
++            fprintf(stderr, "warn: cudaSetDeviceFlags(BlockingSync) failed: %s "
++                "(context already active?)\n", cudaGetErrorString(fe));
++            cudaGetLastError();
++        }
++    }
++
+     cudaSetDevice(hypers.gpu_id);
+ 
+     // Multi-GPU: initialize NCCL
+@@ -2000,8 +2525,28 @@
+             throw std::runtime_error("nccl_id must be " + std::to_string(sizeof(ncclUniqueId)) + " bytes");
+         ncclUniqueId nccl_id;
+         memcpy(&nccl_id, hypers.nccl_id.data(), sizeof(nccl_id));
+-        ncclCommInitRank(&pufferl->nccl_comm, hypers.world_size, nccl_id, hypers.rank);
+-        printf("Rank %d/%d: NCCL initialized\n", hypers.rank, hypers.world_size);
++        ncclResult_t nr = ncclCommInitRank(&pufferl->nccl_comm, hypers.world_size, nccl_id, hypers.rank);
++        if (nr != ncclSuccess)
++            throw std::runtime_error("ncclCommInitRank failed (rank " +
++                std::to_string(hypers.rank) + "): " + ncclGetErrorString(nr));
++        // Eager warmup collective: NCCL connects transports lazily on the first
++        // collective. Running one now (a) surfaces broken transports (e.g. dead
++        // PCIe P2P => NCCL_P2P_DISABLE=1) as a checked error HERE instead of a
++        // poisoned async "illegal memory access" at some later stream op, and
++        // (b) guarantees connections exist before any cudagraph capture, which
++        // NCCL requires for captured collectives.
++        float* warm;
++        cudaMalloc(&warm, sizeof(float));
++        cudaMemset(warm, 0, sizeof(float));
++        nr = ncclAllReduce(warm, warm, 1, ncclFloat, ncclSum, pufferl->nccl_comm, 0);
++        cudaError_t we = cudaDeviceSynchronize();
++        cudaFree(warm);
++        if (nr != ncclSuccess || we != cudaSuccess)
++            throw std::runtime_error("NCCL warmup allreduce failed (rank " +
++                std::to_string(hypers.rank) + "): " +
++                (nr != ncclSuccess ? ncclGetErrorString(nr) : cudaGetErrorString(we)) +
++                " — if this host has broken GPU P2P, set NCCL_P2P_DISABLE=1");
++        printf("Rank %d/%d: NCCL initialized, warmup allreduce ok\n", hypers.rank, hypers.world_size);
+     }
+ 
+     ulong seed = hypers.seed + hypers.rank;
+@@ -2081,13 +2626,14 @@
+         alloc_register(acts, &pufferl->buffer_states[i]);
+     }
+     int mask_size = pufferl->vec->action_mask_size;
++    int league_on = hypers.league_routing ? 1 : 0;
+     register_rollout_buffers(pufferl->rollouts,
+-        acts, horizon, total_agents, input_size, num_action_heads, mask_size);
++        acts, horizon, total_agents, input_size, num_action_heads, mask_size, league_on);
+     register_train_buffers(pufferl->train_buf,
+         acts, minibatch_segments, horizon, input_size,
+-        hidden_size, num_action_heads, num_layers, mask_size);
++        hidden_size, num_action_heads, num_layers, mask_size, league_on);
+     register_rollout_buffers(pufferl->train_rollouts,
+-        acts, total_agents, horizon, input_size, num_action_heads, mask_size);
++        acts, total_agents, horizon, input_size, num_action_heads, mask_size, league_on);
+     register_ppo_buffers(pufferl->ppo_bufs_puf,
+         acts, minibatch_segments, hypers.horizon, decoder_output_size, is_continuous);
+     register_prio_buffers(pufferl->prio_bufs,
+@@ -2103,10 +2649,16 @@
+     pufferl->losses_puf = {.shape = {NUM_LOSSES}};
+     alloc_register(acts, &pufferl->losses_puf);
+ 
++    pufferl->kl_guard_puf = {.shape = {KL_GUARD_SLOTS}};
++    alloc_register(acts, &pufferl->kl_guard_puf);
++
+     pufferl->advantages_puf = {.shape = {total_agents, horizon}};
+     alloc_register(acts, &pufferl->advantages_puf);
+ 
+-    muon_init(&pufferl->muon, params, hypers.lr, hypers.beta1, hypers.eps, 0.0, acts);
++    // weight_decay stays upstream's 0.0 for the orthogonalized path;
++    // muon_wd_1d applies to 1-D params only (docs/training.md).
++    muon_init(&pufferl->muon, params, hypers.lr, hypers.beta1, hypers.eps, 0.0,
++        hypers.muon_wd_1d, acts);
+     pufferl->muon.nccl_comm = pufferl->nccl_comm;
+     pufferl->muon.world_size = hypers.world_size;
+ 
+@@ -2121,15 +2673,40 @@
+         return nullptr;
+     }
+ 
+-    pufferl->grad_puf = {.data = (precision_t*)grads->mem, .shape = {grads->total_elems}};
+-    pufferl->param_puf = {.data = (precision_t*)params->mem, .shape = {params->total_elems}};
++#ifdef PTCG_NATIVE
++    ptcg_bind_train_graph(&pufferl->train_buf);
++#endif
++    // Flat views span the PADDED arenas (16B-aligned tensor starts): muon's
++    // walk, the momentum buffer, grad clip/allreduce, and the warmup weight
++    // snapshots all index by arena offset. Gap floats are zero and inert.
++    long params_span = params->total_bytes / (long)sizeof(precision_t);
++    long grads_span = grads->total_bytes / (long)sizeof(precision_t);
++    pufferl->grad_puf = {.data = (precision_t*)grads->mem, .shape = {grads_span}};
++    pufferl->param_puf = {.data = (precision_t*)params->mem, .shape = {params_span}};
+ 
++    // LOCAL PATCH — gradient accumulation arena (mirrors grad_puf's padded
++    // layout so muon's arena-offset walk applies to it unchanged).
++    pufferl->grad_accum_puf = {};
++    pufferl->train_accum_captured = false;
++    if (hypers.accum_minibatches > 1) {
++        precision_t* acc_mem = nullptr;
++        cudaError_t ae = cudaMalloc(&acc_mem, grads_span * sizeof(precision_t));
++        if (ae != cudaSuccess) {
++            fprintf(stderr, "FATAL: grad-accum arena alloc (%ld floats): %s\n",
++                    grads_span, cudaGetErrorString(ae));
++            return nullptr;
++        }
++        cudaMemset(acc_mem, 0, grads_span * sizeof(precision_t));
++        pufferl->grad_accum_puf = {.data = acc_mem, .shape = {grads_span}};
++    }
++
+     ulong init_seed = hypers.seed;
+     policy_init_weights(&pufferl->policy, pufferl->weights, &init_seed, pufferl->default_stream);
+-    pufferl->master_weights = {.data = (float*)pufferl->param_puf.data, .shape = {params->total_elems}};
++    pufferl->master_weights = {.data = (float*)pufferl->param_puf.data,
++                               .shape = {params->total_bytes / (long)sizeof(float)}};
+     if (USE_BF16) {
+-        pufferl->master_weights = {.shape = {params->total_elems}};
+-        cudaMalloc(&pufferl->master_weights.data, params->total_elems * sizeof(float));
++        pufferl->master_weights = {.shape = {params->total_bytes / (long)sizeof(float)}};
++        cudaMalloc(&pufferl->master_weights.data, params->total_bytes);
+         int n = numel(pufferl->param_puf.shape);
+         cast<<<grid_size(n), BLOCK_SIZE, 0, pufferl->default_stream>>>(
+             pufferl->master_weights.data, pufferl->param_puf.data, n);
+@@ -2149,7 +2726,14 @@
+     cudaMemset(pufferl->losses_puf.data, 0, NUM_LOSSES * sizeof(float));
+     float one = 1.0f;
+     cudaMemcpy(pufferl->ppo_bufs_puf.grad_loss.data, &one, sizeof(float), cudaMemcpyHostToDevice);
++    // KL guard: gate starts open (1.0), counters zero. muon reads the gate
++    // slot; with the guard disabled nothing ever writes it, so the veto path
++    // is inert.
++    cudaMemset(pufferl->kl_guard_puf.data, 0, KL_GUARD_SLOTS * sizeof(float));
++    cudaMemcpy(pufferl->kl_guard_puf.data + KL_GUARD_GATE, &one, sizeof(float),
++        cudaMemcpyHostToDevice);
+     muon_post_create(&pufferl->muon);
++    pufferl->muon.gate_ptr = pufferl->kl_guard_puf.data + KL_GUARD_GATE;
+ 
+     // Set up frozen banks declared in vec_kwargs (num_frozen_banks +
+     // frozen_bank_pct: each bank gets floor(agents_per_buffer * pct) agents).
+@@ -2179,6 +2763,38 @@
+         }
+     }
+ 
++    // League routing: resolve the env's tag column and stamp per-env tags to
++    // match bank_layout (env i -> slot i, buffer-major; requires 1 agent per
++    // env). Done here, BEFORE static_vec_reset, so the very first games are
++    // already drawn as league games — no mirror transient.
++    if (hypers.league_routing && pufferl->num_frozen_banks > 0) {
++        if (!env_league_tag_col) {
++            fprintf(stderr, "create_pufferl: league_routing set but env does "
++                "not export env_league_tag_col\n");
++            return nullptr;
++        }
++        if (vec->size != total_agents) {
++            fprintf(stderr, "create_pufferl: league_routing requires 1 agent "
++                "per env (envs=%d agents=%d)\n", vec->size, total_agents);
++            return nullptr;
++        }
++        pufferl->league_tag_col = env_league_tag_col();
++        int apb = total_agents / num_buffers;
++        std::vector<int> tags(vec->size, 0);
++        for (int i = 0; i < vec->size; i++) {
++            int rel = i % apb;
++            int bk = 0;
++            for (int k = 1; k <= pufferl->num_frozen_banks; k++) {
++                if (rel >= pufferl->bank_layout[k] && rel < pufferl->bank_layout[k + 1]) {
++                    bk = k;
++                    break;
++                }
++            }
++            tags[i] = bk;
++        }
++        static_vec_set_env_tags(vec, tags.data());
++    }
++
+     // Cudagraph rolluts and entire training step
+     if (hypers.cudagraphs >= 0) {
+         pufferl->fused_rollout_cudagraphs = (cudaGraphExec_t*)calloc(horizon*num_buffers, sizeof(cudaGraphExec_t));
+@@ -2212,7 +2828,13 @@
+                 int buf = i % num_buffers;
+                 tl_stream = pufferl->streams[buf];
+                 net_callback_wrapper(pufferl.get(), buf, i / num_buffers);
+-                cudaDeviceSynchronize();
++                cudaError_t we = cudaDeviceSynchronize();
++                if (we != cudaSuccess) {
++                    fprintf(stderr, "FATAL: rollout warmup epoch %ld buf %d "
++                        "t %d: %s\n", pufferl->epoch, buf, i / num_buffers,
++                        cudaGetErrorString(we));
++                    abort();
++                }
+             }
+         }
+         pufferl->rollout_captured = true;
+@@ -2233,6 +2855,14 @@
+         cudaFree(saved_weights);
+         cudaMemcpy(pufferl->muon.mb_puf.data, saved_momentum, wb_bytes, cudaMemcpyDeviceToDevice);
+         cudaFree(saved_momentum);
++        // The warmup train_impl iterations ran on garbage rollouts and
++        // polluted the loss accumulators and the KL guard counters — reset
++        // both so the first logged epoch is real (this was the old
++        // first-epoch ent≈3.87 artifact) and the guard starts clean.
++        cudaMemset(pufferl->losses_puf.data, 0, NUM_LOSSES * sizeof(float));
++        cudaMemset(pufferl->kl_guard_puf.data, 0, KL_GUARD_SLOTS * sizeof(float));
++        cudaMemcpy(pufferl->kl_guard_puf.data + KL_GUARD_GATE, &one, sizeof(float),
++            cudaMemcpyHostToDevice);
+         if (USE_BF16) {
+             int n = numel(pufferl->param_puf.shape);
+             cast<<<grid_size(n), BLOCK_SIZE, 0, pufferl->default_stream>>>(
+@@ -2282,9 +2912,15 @@
+         cudaProfilerStop();
+     }
+ 
+-    cudaGraphExecDestroy(pufferl.train_cudagraph);
+-    for (int i = 0; i < pufferl.hypers.horizon * pufferl.hypers.num_buffers; i++) {
+-        cudaGraphExecDestroy(pufferl.fused_rollout_cudagraphs[i]);
++    // Graphs are only allocated when cudagraphs >= 0; guard or this derefs
++    // NULL on a graphs-off close.
++    if (pufferl.train_captured) cudaGraphExecDestroy(pufferl.train_cudagraph);
++    if (pufferl.train_accum_captured) cudaGraphExecDestroy(pufferl.train_accum_cudagraph);
++    if (pufferl.grad_accum_puf.data) cudaFree(pufferl.grad_accum_puf.data);
++    if (pufferl.fused_rollout_cudagraphs) {
++        for (int i = 0; i < pufferl.hypers.horizon * pufferl.hypers.num_buffers; i++) {
++            cudaGraphExecDestroy(pufferl.fused_rollout_cudagraphs[i]);
++        }
+     }
+ 
+     policy_weights_free(&pufferl.policy, &pufferl.weights);
+--- a/src/bindings.cu
++++ b/src/bindings.cu
+@@ -3,6 +3,7 @@
+ #include <pybind11/pybind11.h>
+ #include <pybind11/stl.h>
+ #include <pybind11/numpy.h>
++#include <unistd.h>
+ #include "pufferlib.cu"
+ 
+ #define _PUFFER_STRINGIFY(x) #x
+@@ -29,6 +30,15 @@
+     result["agent_steps"] = global_step * gpus;
+     result["uptime"] = now - pufferl.start_time;
+     result["epoch"] = epoch;
++    // The APPLIED learning rate, read back from the device pointer muon uses.
++    // Mirroring the schedule independently on the python side for wandb would
++    // mean making every schedule change twice or the telemetry lies
++    // (docs/training.md).
++    float lr_host = 0.0f;
++    if (pufferl.muon.lr_ptr != nullptr) {
++        cudaMemcpy(&lr_host, pufferl.muon.lr_ptr, sizeof(float), cudaMemcpyDeviceToHost);
++    }
++    result["lr"] = lr_host;
+ 
+     // Environment stats
+     pybind11::dict env_dict;
+@@ -42,6 +52,11 @@
+     pybind11::dict losses_dict;
+     float losses_host[NUM_LOSSES];
+     cudaMemcpy(losses_host, pufferl.losses_puf.data, sizeof(losses_host), cudaMemcpyDeviceToHost);
++    // KL guard telemetry: minibatches vetoed since the last log. Only the
++    // SKIPPED slot is reset — the GATE slot must keep its last value (muon
++    // reads it every step) and MB_KL is overwritten every minibatch anyway.
++    float guard_host[KL_GUARD_SLOTS];
++    cudaMemcpy(guard_host, pufferl.kl_guard_puf.data, sizeof(guard_host), cudaMemcpyDeviceToHost);
+     float n = losses_host[LOSS_N];
+     if (n > 0) {
+         float inv_n = 1.0f / n;
+@@ -52,8 +67,12 @@
+         losses_dict["old_kl"] = losses_host[LOSS_OLD_APPROX_KL] * inv_n;
+         losses_dict["kl"] = losses_host[LOSS_APPROX_KL] * inv_n;
+         losses_dict["clipfrac"] = losses_host[LOSS_CLIPFRAC] * inv_n;
++        losses_dict["kl_skipped"] = guard_host[KL_GUARD_SKIPPED];
++        losses_dict["vf_skipped"] = guard_host[KL_GUARD_SKIPPED_VF];
+     }
+     cudaMemset(pufferl.losses_puf.data, 0, numel(pufferl.losses_puf.shape) * sizeof(float));
++    // SKIPPED and SKIPPED_VF are adjacent — zero both counters
++    cudaMemset(pufferl.kl_guard_puf.data + KL_GUARD_SKIPPED, 0, 2 * sizeof(float));
+     result["loss"] = losses_dict;
+ 
+     // Profile
+@@ -107,9 +126,9 @@
+     pufferl.last_log_step = pufferl.global_step;
+  
+     pybind11::dict env_dict;
+-    // Capacity 64 to fit chess's per-bank hist_score_bank/hist_n_bank entries
+-    // (16 keys across 8 banks) on top of base env-log fields.
+-    Dict* env_out = create_dict(64);
++    // Capacity sized for per-bank keys (ptcg league_w_<b>/league_n_<b>,
++    // chess hist_score_bank/hist_n_bank) on top of base env-log fields.
++    Dict* env_out = create_dict(128);
+     static_vec_eval_log(pufferl.vec, env_out);
+     for (int i = 0; i < env_out->size; i++) {
+         env_dict[env_out->items[i].key] = env_out->items[i].value;
+@@ -177,39 +196,169 @@
+     close_impl(pufferl);
+ }
+ 
++// Weight files are PACKED fp32 blobs (torch-converter format); the live
++// arena is 16B-aligned per tensor — every save/load goes through the
++// packed<->arena helpers in pufferlib.cu.
+ void save_weights(pybind11::object pufferl_obj, const std::string& path) {
+     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+-    int64_t nbytes = numel(pufferl.master_weights.shape) * sizeof(float);
+-    std::vector<char> buf(nbytes);
+-    cudaMemcpy(buf.data(), pufferl.master_weights.data, nbytes, cudaMemcpyDeviceToHost);
++    int64_t arena_n = numel(pufferl.master_weights.shape);
++    int64_t packed_n = pufferl.params_alloc.total_elems;
++    std::vector<float> arena_img(arena_n);
++    cudaMemcpy(arena_img.data(), pufferl.master_weights.data,
++               arena_n * sizeof(float), cudaMemcpyDeviceToHost);
++    std::vector<float> packed(packed_n);
++    arena_host_to_packed_blob(&pufferl.params_alloc, arena_img.data(), packed.data());
+     FILE* f = fopen(path.c_str(), "wb");
+     if (!f) throw std::runtime_error("Failed to open " + path + " for writing");
+-    fwrite(buf.data(), 1, nbytes, f);
++    fwrite(packed.data(), sizeof(float), packed_n, f);
++    fclose(f);
++}
++
++// Parity/debug entry: run the train-path policy forward on a caller-supplied
++// obs batch and return the decoder output (for ptcg: (B, 65) = [64 raw option
++// scores || oracle value]). Batch size must equal the minibatch the trainer
++// was created with — activations are sized for exactly that shape.
++pybind11::array_t<float> debug_forward(pybind11::object pufferl_obj,
++        pybind11::array_t<float, pybind11::array::c_style | pybind11::array::forcecast> obs) {
++    PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
++    if (sizeof(precision_t) != sizeof(float))
++        throw std::runtime_error("debug_forward: fp32 builds only");
++    TrainGraph& graph = pufferl.train_buf;
++    long need = numel(graph.mb_obs.shape);
++    if ((long)obs.size() != need)
++        throw std::runtime_error("debug_forward: need exactly " +
++            std::to_string(need) + " floats (minibatch " +
++            std::to_string(graph.mb_obs.shape[0] * graph.mb_obs.shape[1]) +
++            " x obs " + std::to_string(graph.mb_obs.shape[2]) + "), got " +
++            std::to_string((long)obs.size()));
++    cudaMemcpy(graph.mb_obs.data, obs.data(), need * sizeof(float),
++               cudaMemcpyHostToDevice);
++    puf_zero(&graph.mb_state, pufferl.default_stream);
++    PrecisionTensor dec = policy_forward_train(&pufferl.policy, pufferl.weights,
++        pufferl.train_activations, graph.mb_obs, graph.mb_state,
++        pufferl.default_stream);
++    cudaStreamSynchronize(pufferl.default_stream);
++    cudaError_t e = cudaGetLastError();
++    if (e != cudaSuccess)
++        throw std::runtime_error(std::string("debug_forward CUDA error: ") +
++            cudaGetErrorString(e));
++    long rows = dec.shape[0], cols = numel(dec.shape) / dec.shape[0];
++    pybind11::array_t<float> out({rows, cols});
++    cudaMemcpy(out.mutable_data(), dec.data, rows * cols * sizeof(float),
++               cudaMemcpyDeviceToHost);
++    return out;
++}
++
++// Full trainer state for crash resume: weights + muon momentum + step/epoch.
++// Separate from save_weights: the step-stamped weight .bins stay bare fp32
++// blobs (the eval converter and native_weights.py depend on that layout).
++// Written atomically (tmp + rename) so a crash mid-write never eats the
++// previous state.
++struct PtcgStateHeader {
++    char magic[8];       // "PTCGSTA1"
++    long global_step;
++    long epoch;
++    long n_params;
++};
++
++void save_state(pybind11::object pufferl_obj, const std::string& path) {
++    PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
++    long arena_n = numel(pufferl.master_weights.shape);
++    long packed_n = pufferl.params_alloc.total_elems;
++    // momentum mirrors the aligned arena layout — same gather applies
++    std::vector<float> w_img(arena_n), m_img(arena_n);
++    cudaMemcpy(w_img.data(), pufferl.master_weights.data,
++               arena_n * sizeof(float), cudaMemcpyDeviceToHost);
++    cudaMemcpy(m_img.data(), pufferl.muon.mb_puf.data,
++               arena_n * sizeof(float), cudaMemcpyDeviceToHost);
++    std::vector<float> w_packed(packed_n), m_packed(packed_n);
++    arena_host_to_packed_blob(&pufferl.params_alloc, w_img.data(), w_packed.data());
++    arena_host_to_packed_blob(&pufferl.params_alloc, m_img.data(), m_packed.data());
++    PtcgStateHeader hdr;
++    memcpy(hdr.magic, "PTCGSTA1", 8);
++    hdr.global_step = pufferl.global_step;
++    hdr.epoch = pufferl.epoch;
++    hdr.n_params = packed_n;
++    std::string tmp = path + ".tmp";
++    FILE* f = fopen(tmp.c_str(), "wb");
++    if (!f) throw std::runtime_error("Failed to open " + tmp + " for writing");
++    fwrite(&hdr, sizeof(hdr), 1, f);
++    fwrite(w_packed.data(), sizeof(float), packed_n, f);
++    fwrite(m_packed.data(), sizeof(float), packed_n, f);
++    fflush(f);
++    fsync(fileno(f));
++    fclose(f);
++    if (rename(tmp.c_str(), path.c_str()) != 0)
++        throw std::runtime_error("Failed to rename " + tmp + " -> " + path);
++}
++
++void load_state(pybind11::object pufferl_obj, const std::string& path) {
++    PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
++    long arena_n = numel(pufferl.master_weights.shape);
++    long packed_n = pufferl.params_alloc.total_elems;
++    int64_t packed_bytes = packed_n * (int64_t)sizeof(float);
++    FILE* f = fopen(path.c_str(), "rb");
++    if (!f) throw std::runtime_error("Failed to open " + path + " for reading");
++    PtcgStateHeader hdr;
++    if (fread(&hdr, sizeof(hdr), 1, f) != 1 || memcmp(hdr.magic, "PTCGSTA1", 8) != 0) {
++        fclose(f);
++        throw std::runtime_error(path + " is not a PTCGSTA1 state file");
++    }
++    if (hdr.n_params != packed_n) {
++        fclose(f);
++        throw std::runtime_error("State param count mismatch: file " +
++            std::to_string(hdr.n_params) + ", model " + std::to_string(packed_n));
++    }
++    std::vector<float> w_packed(packed_n), m_packed(packed_n);
++    if (fread(w_packed.data(), 1, packed_bytes, f) != (size_t)packed_bytes ||
++        fread(m_packed.data(), 1, packed_bytes, f) != (size_t)packed_bytes) {
++        fclose(f);
++        throw std::runtime_error("Truncated state file " + path);
++    }
+     fclose(f);
++    std::vector<float> w_img(arena_n, 0.0f), m_img(arena_n, 0.0f);
++    packed_blob_to_arena_host(&pufferl.params_alloc, w_packed.data(), w_img.data());
++    packed_blob_to_arena_host(&pufferl.params_alloc, m_packed.data(), m_img.data());
++    cudaMemcpy(pufferl.master_weights.data, w_img.data(),
++               arena_n * sizeof(float), cudaMemcpyHostToDevice);
++    cudaMemcpy(pufferl.muon.mb_puf.data, m_img.data(),
++               arena_n * sizeof(float), cudaMemcpyHostToDevice);
++    if (USE_BF16) {
++        int nn = numel(pufferl.param_puf.shape);
++        cast<<<grid_size(nn), BLOCK_SIZE, 0, pufferl.default_stream>>>(
++            pufferl.param_puf.data, pufferl.master_weights.data, nn);
++    }
++    cudaDeviceSynchronize();
++    // epoch drives the cosine LR + prio-beta anneals in train_impl; restoring
++    // it (not just global_step) is what makes the schedule resume-correct.
++    pufferl.global_step = hdr.global_step;
++    pufferl.epoch = hdr.epoch;
++    pufferl.last_log_step = hdr.global_step;
+ }
+ 
+ void load_weights(pybind11::object pufferl_obj, const std::string& path) {
+     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+-    int64_t nbytes = numel(pufferl.master_weights.shape) * sizeof(float);
++    int64_t packed_bytes = pufferl.params_alloc.total_elems * (int64_t)sizeof(float);
++    int64_t arena_n = numel(pufferl.master_weights.shape);
+     FILE* f = fopen(path.c_str(), "rb");
+     if (!f) throw std::runtime_error("Failed to open " + path + " for reading");
+-    // Verify file size matches
+     fseek(f, 0, SEEK_END);
+     long file_size = ftell(f);
+     fseek(f, 0, SEEK_SET);
+-    if (file_size != nbytes) {
++    if (file_size != packed_bytes) {
+         fclose(f);
+         throw std::runtime_error("Weight file size mismatch: expected " +
+-            std::to_string(nbytes) + " bytes, got " + std::to_string(file_size));
++            std::to_string(packed_bytes) + " bytes, got " + std::to_string(file_size));
+     }
+-    std::vector<char> buf(nbytes);
+-    size_t nread = fread(buf.data(), 1, nbytes, f);
+-    if ((int64_t)nread != nbytes) {
+-        fclose(f);
+-        throw std::runtime_error("Failed to read weight file");
+-    }
++    std::vector<float> packed(pufferl.params_alloc.total_elems);
++    size_t nread = fread(packed.data(), 1, packed_bytes, f);
+     fclose(f);
+-    cudaMemcpy(pufferl.master_weights.data, buf.data(), nbytes, cudaMemcpyHostToDevice);
++    if ((int64_t)nread != packed_bytes)
++        throw std::runtime_error("Failed to read weight file");
++    std::vector<float> arena_img(arena_n, 0.0f);
++    packed_blob_to_arena_host(&pufferl.params_alloc, packed.data(), arena_img.data());
++    cudaMemcpy(pufferl.master_weights.data, arena_img.data(),
++               arena_n * sizeof(float), cudaMemcpyHostToDevice);
+     if (USE_BF16) {
+         int n = numel(pufferl.param_puf.shape);
+         cast<<<grid_size(n), BLOCK_SIZE, 0, pufferl.default_stream>>>(
+@@ -252,8 +401,42 @@
+ int py_count_aligned(py::object pufferl_obj, int tag_value, int reset_flags) {
+     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+     return pufferl_count_aligned(&pufferl, tag_value, reset_flags);
++}
++
++// Mid-run deck-pool append. tables.c is C, linked in via libstatic_ptcg.a.
++extern "C" int pt_reload_decks(const char* path);
++
++// Swap in a grown training deck pool. MUST be called between _C.train()
++// returning and the next _C.rollouts(): the env threads are parked at the
++// fork-join barrier there, which is the only reason a plain pointer publish is
++// safe (docs/deck-pool.md).
++// Returns the new deck count, or -1 if the blob was rejected (nothing mutated).
++int py_reload_decks(const std::string& path) {
++    return pt_reload_decks(path.c_str());
++}
++
++// Per-deck sampling weights. Names are resolved to ids on the PYTHON side (it
++// owns the pool listing), so this takes a dense vector whose length must equal
++// the live n_decks -- the length check is the guard against a caller that
++// resolved against a stale listing.
++//
++// Unlike reload_decks this does not require parked callers: it publishes under
++// the same lock game_start holds for reading. Returns the number of decks with
++// weight > 0, or -1 if the vector was rejected (nothing mutated).
++extern "C" int pt_set_deck_weights(const float* w, int n);
++extern "C" void pt_clear_deck_weights(void);
++
++int py_set_deck_weights(const std::vector<float>& w) {
++    return pt_set_deck_weights(w.data(), (int)w.size());
+ }
+ 
++void py_clear_deck_weights() { pt_clear_deck_weights(); }
++
++int py_allreduce_i32(py::object pufferl_obj, int value, int op) {
++    PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
++    return pufferl_allreduce_i32(&pufferl, value, op);
++}
++
+ int py_num_envs(py::object pufferl_obj) {
+     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+     return pufferl_num_envs(&pufferl);
+@@ -286,6 +469,15 @@
+     }
+ }
+ 
++// For keys added after callers already existed (parity/bench harnesses build
++// their own train dicts) — missing means "take the default", not "crash".
++double get_config_or(py::dict& kwargs, const char* key, double fallback) {
++    if (!kwargs.contains(key)) {
++        return fallback;
++    }
++    return get_config(kwargs, key);
++}
++
+ Dict* py_dict_to_c_dict(py::dict py_dict) {
+     Dict* c_dict = create_dict(py_dict.size());
+     for (auto item : py_dict) {
+@@ -405,12 +597,18 @@
+     hypers.lr = get_config(train_kwargs, "learning_rate");
+     hypers.min_lr_ratio = get_config(train_kwargs, "min_lr_ratio");
+     hypers.anneal_lr = get_config(train_kwargs, "anneal_lr");
++    // defaulted: model_parity.py builds its own train dict (docs/training.md)
++    hypers.lr_warmup_epochs = (int)get_config_or(train_kwargs, "lr_warmup_epochs", 0);
++    hypers.start_epoch = (int)get_config_or(train_kwargs, "start_epoch", 0);
++    hypers.lr_anneal_from_epoch = (int)get_config_or(train_kwargs, "lr_anneal_from_epoch", 0);
+     // Optimizer
+     hypers.beta1 = get_config(train_kwargs, "beta1");
+     hypers.beta2 = get_config(train_kwargs, "beta2");
+     hypers.eps = get_config(train_kwargs, "eps");
+     // Training
+     hypers.minibatch_size = get_config(train_kwargs, "minibatch_size");
++    // defaulted: parity/eval tools build their own train dicts without it
++    hypers.accum_minibatches = (int)get_config_or(train_kwargs, "accum_minibatches", 1);
+     hypers.replay_ratio = get_config(train_kwargs, "replay_ratio");
+     hypers.total_timesteps = get_config(train_kwargs, "total_timesteps");
+     hypers.max_grad_norm = get_config(train_kwargs, "max_grad_norm");
+@@ -430,6 +628,15 @@
+     // Priority
+     hypers.prio_alpha = get_config(train_kwargs, "prio_alpha");
+     hypers.prio_beta0 = get_config(train_kwargs, "prio_beta0");
++    // KL/value guard + Muon 1-D weight decay (docs/training.md).
++    // Defaulted so existing callers keep working — and default PROTECTIVE:
++    // a run that forgets the flags still gets the guard. vf default 0.5 =
++    // ~20x the healthy value loss (0.023) and well under the measured
++    // ignition trajectory (0.5 -> 10 -> 160 within ~20 epochs).
++    hypers.kl_skip_threshold = get_config_or(train_kwargs, "kl_skip_threshold", 0.05);
++    hypers.vf_skip_threshold = get_config_or(train_kwargs, "vf_skip_threshold", 0.5);
++    hypers.muon_wd_1d = get_config_or(train_kwargs, "muon_wd_1d", 0.01);
++    hypers.league_routing = (int)get_config_or(train_kwargs, "league_routing", 0);
+     hypers.reset_state = get_config(args, "reset_state");
+     // Base-level config ([base] section becomes top-level in args)
+     hypers.cudagraphs = get_config(args, "cudagraphs");
+@@ -521,11 +728,30 @@
+     m.def("close", &puf_close);
+     m.def("save_weights", &save_weights);
+     m.def("load_weights", &load_weights);
++    m.def("save_state", &save_state);
++    m.def("load_state", &load_state);
++    // Weights-only restarts: stamp the checkpoint's per-rank step so
++    // global_step/epoch (and everything derived: wandb x-axes, checkpoint
++    // filenames, eval epoch numbering, epoch-driven schedules) continue from
++    // the parent run instead of 0. load_state overrides this on real resumes.
++    m.def("set_start", [](py::object pufferl_obj, long step) {
++        PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
++        long spe = (long)pufferl.hypers.total_agents * pufferl.hypers.horizon;
++        pufferl.global_step = step;
++        pufferl.epoch = spe > 0 ? step / spe : 0;
++        pufferl.last_log_step = step;
++    });
++    m.def("debug_forward", &debug_forward);
+     m.def("add_frozen_bank", &py_add_frozen_bank);
+     m.def("load_frozen_bank", &py_load_frozen_bank);
+     m.def("set_agent_perm", &py_set_agent_perm);
+     m.def("set_env_tags", &py_set_env_tags);
+     m.def("count_aligned", &py_count_aligned);
++    m.def("reload_decks", &py_reload_decks);
++    m.def("set_deck_weights", &py_set_deck_weights);
++    m.def("clear_deck_weights", &py_clear_deck_weights);
++    m.def("allreduce_i32", &py_allreduce_i32, py::arg("pufferl"),
++          py::arg("value"), py::arg("op") = 0);
+     m.def("num_envs", &py_num_envs);
+     m.def("python_vec_recv", &python_vec_recv);
+     m.def("python_vec_send", &python_vec_send);
+@@ -546,6 +772,8 @@
+         .def_readwrite("lr", &HypersT::lr)
+         .def_readwrite("min_lr_ratio", &HypersT::min_lr_ratio)
+         .def_readwrite("anneal_lr", &HypersT::anneal_lr)
++        .def_readwrite("lr_warmup_epochs", &HypersT::lr_warmup_epochs)
++        .def_readwrite("lr_anneal_from_epoch", &HypersT::lr_anneal_from_epoch)
+         .def_readwrite("beta1", &HypersT::beta1)
+         .def_readwrite("beta2", &HypersT::beta2)
+         .def_readwrite("eps", &HypersT::eps)
+--- a/src/muon.cu
++++ b/src/muon.cu
+@@ -46,7 +46,13 @@
+ }
+ 
+ // Nesterov with f32 momentum accumulator and precision_t gradients
+-__global__ void muon_nesterov(float* __restrict__ mb, precision_t* __restrict__ gc, float mu, int n) {
++// LOCAL PATCH (deviation from vendored @ c5d3c63): gate pointer -- when the
++// trainer's KL guard writes 0 there, the whole step (momentum included) is a
++// no-op. Must be a branch, not a multiply: the gate exists precisely for
++// minibatches whose gradients may be garbage.
++__global__ void muon_nesterov(float* __restrict__ mb, precision_t* __restrict__ gc,
++        const float* __restrict__ gate, float mu, int n) {
++    if (gate != nullptr && *gate == 0.0f) return;
+     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+     if (idx < n) {
+         float m = mu * mb[idx] + to_float(gc[idx]);
+@@ -55,9 +61,41 @@
+     }
+ }
+ 
++// LOCAL PATCH (deviation from vendored @ c5d3c63): EMA momentum for the 1-D
++// parameter path -- root-cause fix for the divergence mode described in
++// docs/training.md.
++//
++// Upstream applies the classic SUM momentum above to every parameter, then
++// orthogonalizes only ndim>=2 tensors. A 1-D param therefore takes the raw
++// momentum step: ~1/(1-mu) = 20x the mean gradient at steady state, step size
++// proportional to gradient magnitude rather than lr-bounded, and with wd=0
++// nothing damps it -- LN gains and the logit readout enter a sharpening
++// feedback loop (bigger gain -> sharper logits -> bigger gradient) and blow
++// up. The torch control runs use heavyball's nesterov_ema
++// (m = mu*m + (1-mu)*g; update = g + m) and are measurably stable: LN gains
++// pinned at 1.02 where this path drifted 1.46 -> 9.22 -> NaN. Apply that
++// exact rule to the params Muon does not orthogonalize; the >=2-D path stays
++// untouched upstream math.
++__global__ void muon_nesterov_ema(float* __restrict__ mb, precision_t* __restrict__ gc,
++        const float* __restrict__ gate, float mu, int n) {
++    if (gate != nullptr && *gate == 0.0f) return;
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx < n) {
++        float g = to_float(gc[idx]);
++        float m = mu * mb[idx] + (1.0f - mu) * g;
++        mb[idx] = m;
++        gc[idx] = from_float(g + m);
++    }
++}
++
+ // Fused weight update: wb = wb * (1 - lr*wd) - lr * scale * update
++// LOCAL PATCH: gate pointer -- a vetoed step must return without touching wb.
++// A multiplicative gate would still poison weights on non-finite updates
++// (0 * nan = nan), which is exactly when the guard fires.
+ __global__ void muon_weight_update(float* __restrict__ wb, const precision_t* __restrict__ update,
+-        const float* __restrict__ lr_ptr, float wd, float scale, int n) {
++        const float* __restrict__ lr_ptr, const float* __restrict__ gate,
++        float wd, float scale, int n) {
++    if (gate != nullptr && *gate == 0.0f) return;
+     float lr = *lr_ptr;
+     float wd_scale = 1.0f - lr * wd;
+     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+@@ -85,6 +123,13 @@
+ 
+ struct Muon {
+     double momentum, weight_decay, eps;
++    // LOCAL PATCH: decoupled weight decay applied ONLY to 1-D params (the
++    // un-orthogonalized path); weight_decay above stays upstream's global
++    // knob, still passed 0.0 at the call site so >=2-D behaviour is
++    // unchanged. gate_ptr is the trainer's KL-guard veto (1.0 = apply step,
++    // 0.0 = skip); nullptr disables.
++    double wd_1d;
++    const float* gate_ptr;
+     float lr_val_init;
+     float* lr_ptr;
+     float* lr_derived_ptr;
+@@ -101,10 +146,12 @@
+ };
+ 
+ void muon_init(Muon* m, Allocator* param_alloc, double lr_val,
+-        double momentum, double eps, double weight_decay,
++        double momentum, double eps, double weight_decay, double wd_1d,
+         Allocator* alloc) {
+     m->momentum = momentum;
+     m->weight_decay = weight_decay;
++    m->wd_1d = wd_1d;
++    m->gate_ptr = nullptr;
+     m->eps = eps;
+     m->lr_val_init = (float)lr_val;
+     m->lr_ptr = nullptr;
+@@ -113,7 +160,10 @@
+     m->nccl_comm = nullptr;
+     m->world_size = 1;
+     m->max_M = 0; m->max_N = 0;
+-    long n = param_alloc->total_elems;
++    // Momentum mirrors the params ARENA layout (incl. 16B alignment gaps),
++    // not the packed element count — muon indexes grads/momentum by arena
++    // offset. Gap floats stay zero (arena memset; backward never writes them).
++    long n = param_alloc->total_bytes / (long)sizeof(float);
+     m->lr_puf =         {.shape = {1}};
+     m->lr_derived_puf = {.shape = {2}};
+     m->mb_puf =         {.shape = {n}};
+@@ -171,21 +221,34 @@
+     muon_clip_norm<<<grid_size(numel(grads.shape)), BLOCK_SIZE, 0, stream>>>(
+         grads.data, m->grad_norm_ptr, max_grad_norm, 1e-6f, numel(grads.shape));
+ 
+-    // Nesterov momentum
+-    muon_nesterov<<<grid_size(numel(m->mb_puf.shape)), BLOCK_SIZE, 0, stream>>>(
+-        m->mb_puf.data, grads.data, (float)m->momentum, numel(m->mb_puf.shape));
++    // LOCAL PATCH: the momentum kernel moved from one arena-wide launch into
++    // the per-param walk below so the 1-D path can use EMA accumulation while
++    // the >=2-D path keeps the classic rule. Both kernels are elementwise on
++    // disjoint regions, so the >=2-D math is bit-identical to the upstream
++    // arena-wide launch; alignment-gap floats (no-op'd through the kernel
++    // upstream) are simply skipped and stay zero.
+ 
+     long offset = 0;
+     for (int _i = 0; _i < m->param_alloc->num_regs; _i++) {
+         AllocEntry& e = m->param_alloc->regs[_i];
++        // mirror alloc_create's 16B alignment (4 floats) — params/grads/
++        // momentum all live in identically-laid-out aligned arenas
++        static_assert(sizeof(precision_t) == sizeof(float),
++            "aligned arena walk shares one element offset across the fp32 "
++            "master and precision_t grads — only valid when they match");
++        offset = (offset + 3) & ~3L;
+         precision_t* gc_ptr = grads.data + offset;
+         float* wb_ptr = weights.data + offset;
++        float* mb_ptr = m->mb_puf.data + offset;
+         long ne = numel(e.shape);
+         const precision_t* update_ptr = gc_ptr;
+         float scale = 1.0f;
++        float wd = (float)m->weight_decay;
+ 
+         // Orthogonalize the update
+         if (ndim(e.shape) >= 2) {
++            muon_nesterov<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
++                mb_ptr, gc_ptr, m->gate_ptr, (float)m->momentum, (int)ne);
+             long R = e.shape[0], C = ne / R;
+             long M = min(R, C), N = max(R, C);
+             bool tall = R > C;
+@@ -218,10 +281,17 @@
+ 
+             update_ptr = x_buf.data;
+             scale = sqrtf(fmaxf(1.0f, (float)R / (float)C));
++        } else {
++            // LOCAL PATCH: 1-D params — EMA momentum (see muon_nesterov_ema)
++            // and their own decoupled weight decay. The classic-sum update at
++            // wd 0 is the diagnosed divergence path.
++            muon_nesterov_ema<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
++                mb_ptr, gc_ptr, m->gate_ptr, (float)m->momentum, (int)ne);
++            wd = (float)m->wd_1d;
+         }
+ 
+         muon_weight_update<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
+-            wb_ptr, update_ptr, m->lr_ptr, (float)m->weight_decay, scale, (int)ne);
++            wb_ptr, update_ptr, m->lr_ptr, m->gate_ptr, wd, scale, (int)ne);
+         offset += ne;
+     }
+ }
+--- a/src/kernels.cu
++++ b/src/kernels.cu
+@@ -423,6 +423,13 @@
+     long total_bytes = 0;
+ };
+ 
++// Every tensor is 16B-aligned — cublas picks vectorized kernels by shape and
++// arch and HARD-FAULTS ("misaligned address" on Blackwell) on unaligned
++// operands, so packing the params arena is not an option. The consumers that
++// once assumed packed layout (muon's flat walk, the weight-blob load/save,
++// the flat NCCL/momentum buffers) all mirror this SAME alignment rule — see
++// PUF_ALIGN_FLOATS in muon.cu and the per-param gather/scatter in bindings.
++
+ static void alloc_register_impl(Allocator* alloc, void** data_ptr, int64_t* shape, int elem_size) {
+     alloc->regs = (AllocEntry*)realloc(alloc->regs, (alloc->num_regs + 1) * sizeof(AllocEntry));
+     alloc->regs[alloc->num_regs++] = {data_ptr, shape, elem_size};
+--- a/src/vecenv.h
++++ b/src/vecenv.h
+@@ -88,6 +88,13 @@
+     float* gpu_rewards;
+     float* gpu_terminals;
+     unsigned char* gpu_action_mask;  // NULL unless env defines MY_ACTION_MASK
++    // PTCG: decoder row (all action logits + the value column) mirrored back
++    // to the host so the env can log what the policy actually thought at each
++    // decision. NULL unless MY_DECODER_EXPORT and the env asks for it at
++    // runtime -- a training run that is not writing an event log pays nothing.
++    float* dec;
++    float* gpu_dec;
++    int dec_cols;
+     cudaStream_t* streams;
+     StaticThreading* threading;
+     int obs_size;
+@@ -204,6 +211,19 @@
+ 
+ #define OMP_WAITING 5
+ #define OMP_RUNNING 6
++
++// PTCG: buffer-state waits span whole phases (a buffer thread idles for the
++// entire train step; the main thread idles for the entire rollout). Pure spins
++// burn a core each, which starves the OMP env workers on cgroup-quota'd cloud
++// boxes (2-rank DDP livelock: rank0's idle spinners throttle rank1's rollout,
++// rank0's allreduce then waits forever). Spin briefly for fast handoffs, then
++// sleep 50us per check; handoffs happen once per phase so the latency is noise.
++static inline void ptcg_wait_relax(int* spins) {
++    if (++(*spins) > 4096) {
++        struct timespec ts = {0, 50000};
++        nanosleep(&ts, NULL);
++    }
++}
+ 
+ // Forward declare env-provided functions (defined in binding.c after this include)
+ void my_init(Env* env, Dict* kwargs);
+@@ -262,17 +282,30 @@
+ 
+     printf("Num workers: %d\n", num_workers);
+     while (true) {
++        int spins = 0;
+         while (atomic_load(&buffer_states[buf]) != OMP_RUNNING) {
+             if (atomic_load(&threading->shutdown)) {
+                 return NULL;
+             }
++            ptcg_wait_relax(&spins);
+         }
+         cudaStream_t stream = vec->streams[buf];
+ 
+         float* my_accum = &threading->accum[buf * NUM_EVAL_PROF];
+         struct timespec t0, t1;
++
++        // PTCG: opt-in progress heartbeat (PTCG_DEBUG_ROLLOUT=1) — tells a
++        // stalled rollout apart from a slow one without a debugger.
++        static int hb = -1;
++        if (hb < 0) { const char* e = getenv("PTCG_DEBUG_ROLLOUT"); hb = (e && e[0] == '1'); }
+ 
+         for (int t = 0; t < horizon; t++) {
++            if (hb && (t % 16) == 0) {
++                struct timespec hb_ts;
++                clock_gettime(CLOCK_MONOTONIC, &hb_ts);
++                fprintf(stderr, "[hb buf=%d t=%d/%d %ld.%03lds]\n", buf, t, horizon,
++                        (long)hb_ts.tv_sec, hb_ts.tv_nsec / 1000000);
++            }
+             clock_gettime(CLOCK_MONOTONIC, &t0);
+             net_callback(ctx, buf, t);
+ 
+@@ -281,7 +314,27 @@
+                 &vec->gpu_actions[agent_start * NUM_ATNS],
+                 agents_per_buffer * NUM_ATNS * sizeof(float),
+                 cudaMemcpyDeviceToHost, stream);
+-            cudaStreamSynchronize(stream);
++            // Same trip as the actions: the env reads this row in c_step, so
++            // it must land before the stream sync below. ~260KB per step at
++            // 1024 agents, against 44MB of observations -- not measurable.
++            if (vec->dec && vec->dec != vec->gpu_dec) {
++                cudaMemcpyAsync(
++                    &vec->dec[(size_t)agent_start * vec->dec_cols],
++                    &vec->gpu_dec[(size_t)agent_start * vec->dec_cols],
++                    (size_t)agents_per_buffer * vec->dec_cols * sizeof(float),
++                    cudaMemcpyDeviceToHost, stream);
++            }
++            // PTCG: an unchecked sync after a poisoned context turns the run
++            // into a silent zombie (env loop spins on zeroed actions at
++            // absurd SPS while no forward/training happens). Die loudly.
++            {
++                cudaError_t se = cudaStreamSynchronize(stream);
++                if (se != cudaSuccess) {
++                    fprintf(stderr, "FATAL: rollout buf %d t %d stream sync: %s\n",
++                            buf, t, cudaGetErrorString(se));
++                    abort();
++                }
++            }
+             clock_gettime(CLOCK_MONOTONIC, &t1);
+             my_accum[EVAL_GPU] += (t1.tv_sec - t0.tv_sec) * 1000.0f + (t1.tv_nsec - t0.tv_nsec) / 1e6f;
+ 
+@@ -318,7 +371,14 @@
+                 cudaMemcpyHostToDevice, stream);
+ #endif
+         }
+-        cudaStreamSynchronize(stream);
++        {
++            cudaError_t se = cudaStreamSynchronize(stream);
++            if (se != cudaSuccess) {
++                fprintf(stderr, "FATAL: rollout buf %d end-sync: %s\n",
++                        buf, cudaGetErrorString(se));
++                abort();
++            }
++        }
+         atomic_store(&buffer_states[buf], OMP_WAITING);
+     }
+ }
+@@ -329,7 +389,10 @@
+         atomic_store(&threading->buffer_states[buf], OMP_RUNNING);
+     }
+     for (int buf = 0; buf < vec->buffers; buf++) {
+-        while (atomic_load(&threading->buffer_states[buf]) != OMP_WAITING) {}
++        int spins = 0;
++        while (atomic_load(&threading->buffer_states[buf]) != OMP_WAITING) {
++            ptcg_wait_relax(&spins);
++        }
+     }
+ }
+ 
+@@ -337,7 +400,10 @@
+     StaticThreading* threading = vec->threading;
+     for (int buf = 0; buf < vec->buffers; buf++) {
+         atomic_store(&threading->buffer_states[buf], OMP_RUNNING);
+-        while (atomic_load(&threading->buffer_states[buf]) != OMP_WAITING) {}
++        int spins = 0;
++        while (atomic_load(&threading->buffer_states[buf]) != OMP_WAITING) {
++            ptcg_wait_relax(&spins);
++        }
+     }
+ }
+ 
+@@ -416,6 +482,18 @@
+     vec->envs = my_vec_init(&num_envs, vec->buffer_env_starts, vec->buffer_env_counts,
+                             vec_kwargs, env_kwargs);
+     vec->size = num_envs;
++
++    // Decoder mirror width: every action head's logits, then the value column
++    // the model fuses onto the end. Opt-in at build time (MY_DECODER_EXPORT)
++    // AND at runtime, so a normal training run allocates nothing.
++    vec->dec_cols = 0;
++#ifdef MY_DECODER_EXPORT
++    if (getenv("PTCG_EVENT_LOG")) {
++        int* asz = get_act_sizes();
++        for (int i = 0; i < get_num_act_sizes(); i++) vec->dec_cols += asz[i];
++        vec->dec_cols += 1;
++    }
++#endif
+ 
+     size_t obs_elem_size = obs_element_size();
+     if (gpu) {
+@@ -431,6 +509,13 @@
+ 
+         cudaMemset(vec->gpu_observations, 0, total_agents * OBS_SIZE * obs_elem_size);
+         cudaMemset(vec->gpu_actions, 0, total_agents * NUM_ATNS * sizeof(float));
++        if (vec->dec_cols > 0) {
++            size_t db = (size_t)total_agents * vec->dec_cols * sizeof(float);
++            cudaHostAlloc((void**)&vec->dec, db, cudaHostAllocPortable);
++            cudaMalloc((void**)&vec->gpu_dec, db);
++            cudaMemset(vec->gpu_dec, 0, db);
++            memset(vec->dec, 0, db);
++        }
+         cudaMemset(vec->gpu_rewards, 0, total_agents * sizeof(float));
+         cudaMemset(vec->gpu_terminals, 0, total_agents * sizeof(float));
+     } else {
+@@ -443,6 +528,11 @@
+         vec->gpu_actions = vec->actions;
+         vec->gpu_rewards = vec->rewards;
+         vec->gpu_terminals = vec->terminals;
++        if (vec->dec_cols > 0) {
++            vec->dec = (float*)calloc((size_t)total_agents * vec->dec_cols,
++                                      sizeof(float));
++            vec->gpu_dec = vec->dec;
++        }
+     }
+ 
+ #ifdef MY_ACTION_MASK
+@@ -476,6 +566,9 @@
+             int slot = buf_start + buf_agent;
+             env->observations = (void*)((char*)vec->observations + slot * OBS_SIZE * obs_elem_size);
+             env->actions = vec->actions + slot * NUM_ATNS;
++#ifdef MY_DECODER_EXPORT
++            env->dec = vec->dec ? vec->dec + (size_t)slot * vec->dec_cols : NULL;
++#endif
+             env->rewards = vec->rewards + slot;
+             env->terminals = vec->terminals + slot;
+ #ifdef MY_ACTION_MASK
+@@ -637,6 +730,8 @@
+         cudaDeviceSynchronize();
+         cudaFree(vec->gpu_observations);
+         cudaFree(vec->gpu_actions);
++        if (vec->gpu_dec && vec->gpu_dec != vec->dec) cudaFree(vec->gpu_dec);
++        if (vec->dec) cudaFreeHost(vec->dec);
+         cudaFree(vec->gpu_rewards);
+         cudaFree(vec->gpu_terminals);
+         cudaFreeHost(vec->observations);
+@@ -650,6 +745,8 @@
+     } else {
+         free(vec->observations);
+         free(vec->actions);
++        if (vec->dec && vec->dec != vec->gpu_dec) free(vec->dec);
++        else if (vec->dec) free(vec->dec);
+         free(vec->rewards);
+         free(vec->terminals);
+ #ifdef MY_ACTION_MASK
+--- a/src/ocean.cu
++++ b/src/ocean.cu
+@@ -1,597 +1,46 @@
+-// NMMO3 CUDA encoder: multihot, cuDNN conv, embedding, concat, projection
+-// Included by pufferlib.cu — requires precision_t, PrecisionTensor, Allocator, puf_mm, etc.
++// REPLACED ocean.cu: registers the PTCG custom model (the only env we build).
++// Original nmmo3/nethack encoders removed (and cudnn dependency with them).
++#include "ptcg_model.cu"
+ 
+-#include "cudnn_conv2d.cu"
+-#include "nethack.cu"
+-
+-// ---- NMMO3 constants ----
+-
+-static constexpr int N3_MAP_H = 11, N3_MAP_W = 15, N3_NFEAT = 10;
+-static constexpr int N3_MULTIHOT = 59;
+-static constexpr int N3_MAP_SIZE = N3_MAP_H * N3_MAP_W * N3_NFEAT;
+-static constexpr int N3_PLAYER = 47, N3_REWARD = 10;
+-static constexpr int N3_EMBED_DIM = 32, N3_EMBED_VOCAB = 128;
+-static constexpr int N3_PLAYER_EMBED = N3_PLAYER * N3_EMBED_DIM;
+-static constexpr int N3_C1_IC = 59, N3_C1_OC = 128, N3_C1_K = 5, N3_C1_S = 3;
+-static constexpr int N3_C1_OH = 3, N3_C1_OW = 4;
+-static constexpr int N3_C2_IC = 128, N3_C2_OC = 128, N3_C2_K = 3, N3_C2_S = 1;
+-static constexpr int N3_C2_OH = 1, N3_C2_OW = 2;
+-static constexpr int N3_CONV_FLAT = N3_C2_OC * N3_C2_OH * N3_C2_OW;
+-static constexpr int N3_CONCAT = N3_CONV_FLAT + N3_PLAYER_EMBED + N3_PLAYER + N3_REWARD;
+-
+-__constant__ int N3_OFFSETS[10] = {0, 4, 8, 25, 30, 33, 38, 43, 48, 55};
+-
+-static cudnnDataType_t n3_cudnn_dtype() {
+-    return (PRECISION_SIZE == 2) ? CUDNN_DATA_BFLOAT16 : CUDNN_DATA_FLOAT;
+-}
+-
+-// ---- NMMO3 kernels ----
+-
+-__global__ void n3_multihot_kernel(
+-    precision_t* __restrict__ out, const precision_t* __restrict__ obs, int B, int obs_size) {
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    if (idx >= B * N3_MAP_H * N3_MAP_W) return;
+-    int b = idx / (N3_MAP_H * N3_MAP_W), rem = idx % (N3_MAP_H * N3_MAP_W);
+-    int h = rem / N3_MAP_W, w = rem % N3_MAP_W;
+-    const precision_t* src = obs + b * obs_size + (h * N3_MAP_W + w) * N3_NFEAT;
+-    precision_t* dst = out + b * N3_MULTIHOT * N3_MAP_H * N3_MAP_W;
+-    for (int f = 0; f < N3_NFEAT; f++)
+-        dst[(N3_OFFSETS[f] + (int)to_float(src[f])) * N3_MAP_H * N3_MAP_W + h * N3_MAP_W + w] = from_float(1.0f);
+-}
+-
+-__global__ void n3_embedding_kernel(
+-    precision_t* __restrict__ out, const precision_t* __restrict__ obs,
+-    const precision_t* __restrict__ embed_w, int B, int obs_size) {
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    if (idx >= B * N3_PLAYER) return;
+-    int b = idx / N3_PLAYER, f = idx % N3_PLAYER;
+-    int val = (int)to_float(obs[b * obs_size + N3_MAP_SIZE + f]);
+-    const precision_t* src = embed_w + val * N3_EMBED_DIM;
+-    precision_t* dst = out + b * N3_PLAYER_EMBED + f * N3_EMBED_DIM;
+-    for (int d = 0; d < N3_EMBED_DIM; d++) dst[d] = src[d];
+-}
+-
+-__global__ void n3_concat_kernel(
+-    precision_t* __restrict__ out, const precision_t* __restrict__ conv_flat,
+-    const precision_t* __restrict__ embed, const precision_t* __restrict__ obs,
+-    int B, int obs_size) {
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    if (idx >= B * N3_CONCAT) return;
+-    int b = idx / N3_CONCAT, c = idx % N3_CONCAT;
+-    precision_t val;
+-    if (c < N3_CONV_FLAT) {
+-        int oc = c / (N3_C2_OH * N3_C2_OW), r = c % (N3_C2_OH * N3_C2_OW);
+-        int oh = r / N3_C2_OW, ow = r % N3_C2_OW;
+-        val = conv_flat[b * N3_CONV_FLAT + oc * N3_C2_OH * N3_C2_OW + oh * N3_C2_OW + ow];
+-    } else if (c < N3_CONV_FLAT + N3_PLAYER_EMBED)
+-        val = embed[b * N3_PLAYER_EMBED + (c - N3_CONV_FLAT)];
+-    else if (c < N3_CONV_FLAT + N3_PLAYER_EMBED + N3_PLAYER)
+-        val = obs[b * obs_size + N3_MAP_SIZE + (c - N3_CONV_FLAT - N3_PLAYER_EMBED)];
+-    else
+-        val = obs[b * obs_size + obs_size - N3_REWARD + (c - N3_CONV_FLAT - N3_PLAYER_EMBED - N3_PLAYER)];
+-    out[idx] = val;
+-}
+-
+-__global__ void n3_bias_relu_kernel(
+-    precision_t* __restrict__ data, const precision_t* __restrict__ bias, int total, int dim) {
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    if (idx >= total) return;
+-    data[idx] = from_float(fmaxf(0.0f, to_float(data[idx]) + to_float(bias[idx % dim])));
+-}
+-
+-__global__ void n3_relu_backward_kernel(
+-    precision_t* __restrict__ grad, const precision_t* __restrict__ out, int total) {
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    if (idx >= total) return;
+-    if (to_float(out[idx]) <= 0.0f) grad[idx] = from_float(0.0f);
+-}
+-
+-
+-__global__ void bias_grad_kernel(
+-    precision_t* __restrict__ bgrad, const precision_t* __restrict__ grad, int N, int dim) {
+-    int d = blockIdx.x;
+-    if (d >= dim) return;
+-    float sum = 0.0f;
+-    for (int i = threadIdx.x; i < N; i += blockDim.x)
+-        sum += to_float(grad[i * dim + d]);
+-    for (int offset = 16; offset > 0; offset >>= 1)
+-        sum += __shfl_down_sync(0xffffffff, sum, offset);
+-    __shared__ float sdata[32];
+-    int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+-    if (lane == 0) sdata[warp] = sum;
+-    __syncthreads();
+-    if (warp == 0) {
+-        sum = (lane < (blockDim.x + 31) / 32) ? sdata[lane] : 0.0f;
+-        for (int offset = 16; offset > 0; offset >>= 1)
+-            sum += __shfl_down_sync(0xffffffff, sum, offset);
+-        if (lane == 0) bgrad[d] = from_float(sum);
+-    }
+-}
+-
+-// NCHW bias grad: sum over (B, OH, OW) for each OC channel
+-__global__ void n3_conv_bias_grad_nchw(
+-    precision_t* __restrict__ bgrad, const precision_t* __restrict__ grad,
+-    int B, int OC, int spatial) {
+-    int oc = blockIdx.x;
+-    if (oc >= OC) return;
+-    float sum = 0.0f;
+-    int total = B * spatial;
+-    for (int i = threadIdx.x; i < total; i += blockDim.x) {
+-        int b = i / spatial, s = i % spatial;
+-        sum += to_float(grad[b * OC * spatial + oc * spatial + s]);
+-    }
+-    for (int offset = 16; offset > 0; offset >>= 1)
+-        sum += __shfl_down_sync(0xffffffff, sum, offset);
+-    __shared__ float sdata[32];
+-    int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+-    if (lane == 0) sdata[warp] = sum;
+-    __syncthreads();
+-    if (warp == 0) {
+-        sum = (lane < (blockDim.x + 31) / 32) ? sdata[lane] : 0.0f;
+-        for (int offset = 16; offset > 0; offset >>= 1)
+-            sum += __shfl_down_sync(0xffffffff, sum, offset);
+-        if (lane == 0) bgrad[oc] = from_float(sum);
+-    }
+-}
+-
+-__global__ void n3_concat_backward_conv_kernel(
+-    precision_t* __restrict__ conv_grad, const precision_t* __restrict__ concat_grad, int B) {
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    if (idx >= B * N3_CONV_FLAT) return;
+-    int b = idx / N3_CONV_FLAT, c = idx % N3_CONV_FLAT;
+-    conv_grad[b * N3_CONV_FLAT + c] = concat_grad[b * N3_CONCAT + c];
+-}
+-
+-// Embedding backward: scatter-add grad from concat_grad's player_embed region
+-// into embed_wgrad (float accumulation buffer).
+-// Each (b, f) looked up row obs[b, MAP_SIZE+f] from the table.
+-__global__ void n3_embedding_backward_kernel(
+-    float* __restrict__ embed_wgrad_f,
+-    const precision_t* __restrict__ concat_grad,
+-    const precision_t* __restrict__ obs,
+-    int B, int obs_size) {
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    if (idx >= B * N3_PLAYER * N3_EMBED_DIM) return;
+-    int b = idx / (N3_PLAYER * N3_EMBED_DIM);
+-    int rem = idx % (N3_PLAYER * N3_EMBED_DIM);
+-    int f = rem / N3_EMBED_DIM;
+-    int d = rem % N3_EMBED_DIM;
+-    int val = (int)to_float(obs[b * obs_size + N3_MAP_SIZE + f]);
+-    float g = to_float(concat_grad[b * N3_CONCAT + N3_CONV_FLAT + f * N3_EMBED_DIM + d]);
+-    atomicAdd(&embed_wgrad_f[val * N3_EMBED_DIM + d], g);
+-}
+-
+-// Cast float buffer to precision_t
+-__global__ void n3_float_to_precision_kernel(
+-    precision_t* __restrict__ dst, const float* __restrict__ src, int n) {
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    if (idx < n) dst[idx] = from_float(src[idx]);
+-}
+-
+-// ---- atomicAdd for precision_t ----
+-#ifdef PRECISION_FLOAT
+-__device__ __forceinline__ void atomicAdd_precision(precision_t* addr, precision_t val) {
+-    atomicAdd(addr, val);
+-}
+-#else
+-__device__ __forceinline__ void atomicAdd_precision(precision_t* addr, precision_t val) {
+-    // bf16 atomicAdd via CAS on enclosing 32-bit word
+-    unsigned int* addr_u32 = (unsigned int*)((size_t)addr & ~2ULL);
+-    bool is_high = ((size_t)addr & 2) != 0;
+-    unsigned int old_u32 = *addr_u32, assumed;
+-    do {
+-        assumed = old_u32;
+-        __nv_bfloat16* pair = (__nv_bfloat16*)&old_u32;
+-        float sum = __bfloat162float(pair[is_high]) + __bfloat162float(val);
+-        unsigned int new_u32 = assumed;
+-        ((__nv_bfloat16*)&new_u32)[is_high] = __float2bfloat16(sum);
+-        old_u32 = atomicCAS(addr_u32, assumed, new_u32);
+-    } while (old_u32 != assumed);
+-}
+-#endif
+-
+-// ---- NCHW bias kernels for im2col conv path ----
+-
+-__global__ void conv_bias_kernel(precision_t* __restrict__ data,
+-        const precision_t* __restrict__ bias, int B, int OC, int spatial) {
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int total = B * OC * spatial;
+-    if (idx >= total) return;
+-    int oc = (idx / spatial) % OC;
+-    data[idx] = from_float(to_float(data[idx]) + to_float(bias[oc]));
+-}
+-
+-__global__ void conv_bias_relu_kernel(precision_t* __restrict__ data,
+-        const precision_t* __restrict__ bias, int B, int OC, int spatial) {
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int total = B * OC * spatial;
+-    if (idx >= total) return;
+-    int oc = (idx / spatial) % OC;
+-    data[idx] = from_float(fmaxf(0.0f, to_float(data[idx]) + to_float(bias[oc])));
+-}
+-
+-// ---- im2col + cuBLAS conv (no cuDNN) ----
+-// NCHW layout throughout. Weight stored as (OC, IC*K*K).
+-// im2col produces (B*OH*OW, IC*K*K), matmul with W^T gives (B*OH*OW, OC),
+-// then reshape to NCHW (B, OC, OH, OW).
+-
+-__global__ void im2col_kernel(
+-    const precision_t* __restrict__ input, precision_t* __restrict__ col,
+-    int B, int IC, int IH, int IW, int K, int S, int OH, int OW
+-) {
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int total = B * OH * OW * IC * K * K;
+-    if (idx >= total) return;
+-    int col_w = IC * K * K;
+-    int row = idx / col_w;
+-    int c = idx % col_w;
+-    int b = row / (OH * OW);
+-    int rem = row % (OH * OW);
+-    int oh = rem / OW, ow = rem % OW;
+-    int ic = c / (K * K), kk = c % (K * K);
+-    int kh = kk / K, kw = kk % K;
+-    int ih = oh * S + kh, iw = ow * S + kw;
+-    col[idx] = input[b * IC * IH * IW + ic * IH * IW + ih * IW + iw];
+-}
+-
+-// Backward: col2im — input-centric gather to avoid atomics.
+-// Each thread owns one (b, ic, ih, iw) element and sums contributions from all
+-// (oh, ow, kh, kw) patches that map to it.
+-__global__ void col2im_kernel(
+-    const precision_t* __restrict__ col, precision_t* __restrict__ grad_input,
+-    int B, int IC, int IH, int IW, int K, int S, int OH, int OW
+-) {
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int total = B * IC * IH * IW;
+-    if (idx >= total) return;
+-    int iw = idx % IW;
+-    int ih = (idx / IW) % IH;
+-    int ic = (idx / (IW * IH)) % IC;
+-    int b  = idx / (IW * IH * IC);
+-    float sum = 0.0f;
+-    for (int kh = 0; kh < K; kh++) {
+-        int ih_off = ih - kh;
+-        if (ih_off < 0 || ih_off % S != 0) continue;
+-        int oh = ih_off / S;
+-        if (oh >= OH) continue;
+-        for (int kw = 0; kw < K; kw++) {
+-            int iw_off = iw - kw;
+-            if (iw_off < 0 || iw_off % S != 0) continue;
+-            int ow = iw_off / S;
+-            if (ow >= OW) continue;
+-            int col_idx = (b * OH * OW + oh * OW + ow) * (IC * K * K) + ic * K * K + kh * K + kw;
+-            sum += to_float(col[col_idx]);
+-        }
+-    }
+-    grad_input[idx] = from_float(sum);
+-}
+-
+-// Transpose (B, OC, OH, OW) -> (B*OH*OW, OC)  [NCHW to row-major spatial-first]
+-__global__ void nchw_to_rows_kernel(
+-    const precision_t* __restrict__ src, precision_t* __restrict__ dst,
+-    int B, int OC, int spatial
+-) {
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int total = B * OC * spatial;
+-    if (idx >= total) return;
+-    int b = idx / (OC * spatial);
+-    int oc = (idx / spatial) % OC;
+-    int s = idx % spatial;
+-    dst[(b * spatial + s) * OC + oc] = src[idx];
+-}
+-
+-// Transpose (B*OH*OW, OC) -> (B, OC, OH, OW)  [row-major spatial-first to NCHW]
+-__global__ void rows_to_nchw_kernel(
+-    const precision_t* __restrict__ src, precision_t* __restrict__ dst,
+-    int B, int OC, int spatial
+-) {
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int total = B * OC * spatial;
+-    if (idx >= total) return;
+-    int b = idx / (OC * spatial);
+-    int oc = (idx / spatial) % OC;
+-    int s = idx % spatial;
+-    dst[idx] = src[(b * spatial + s) * OC + oc];
+-}
+-
+-// Forward: im2col conv + bias + optional relu. All NCHW.
+-// col_buf: pre-allocated (max_B * OH * OW, IC * K * K)
+-// mm_buf:  pre-allocated (max_B * OH * OW, OC)  — row-major (spatial-first)
+-static void gemm_conv_forward(
+-    PrecisionTensor* weight, PrecisionTensor* bias,
+-    precision_t* input, precision_t* output,
+-    precision_t* col_buf, precision_t* mm_buf,
+-    int B, int IC, int IH, int IW, int OC, int K, int S, int OH, int OW,
+-    bool relu, cudaStream_t stream
+-) {
+-    int col_rows = B * OH * OW;
+-    int col_cols = IC * K * K;
+-    int total_col = col_rows * col_cols;
+-    int total_out = B * OC * OH * OW;
+-
+-    // im2col: input NCHW -> col (B*OH*OW, IC*K*K)
+-    im2col_kernel<<<grid_size(total_col), BLOCK_SIZE, 0, stream>>>(
+-        input, col_buf, B, IC, IH, IW, K, S, OH, OW);
+-
+-    // matmul: col (B*OH*OW, IC*K*K) @ W^T (IC*K*K, OC) = mm_buf (B*OH*OW, OC)
+-    PrecisionTensor col_t = {.data = col_buf, .shape = {col_rows, col_cols}};
+-    PrecisionTensor mm_t  = {.data = mm_buf,  .shape = {col_rows, OC}};
+-    puf_mm(&col_t, weight, &mm_t, stream);
+-
+-    // transpose (B*OH*OW, OC) -> (B, OC, OH, OW) NCHW + bias + relu
+-    int spatial = OH * OW;
+-    rows_to_nchw_kernel<<<grid_size(total_out), BLOCK_SIZE, 0, stream>>>(
+-        mm_buf, output, B, OC, spatial);
+-    if (relu) {
+-        conv_bias_relu_kernel<<<grid_size(total_out), BLOCK_SIZE, 0, stream>>>(
+-            output, bias->data, B, OC, spatial);
+-    } else {
+-        conv_bias_kernel<<<grid_size(total_out), BLOCK_SIZE, 0, stream>>>(
+-            output, bias->data, B, OC, spatial);
+-    }
+-}
+-
+-// Backward: weight grad + optional input grad via im2col/col2im + cuBLAS.
+-// grad_output is NCHW (B, OC, OH, OW). saved_input is NCHW.
+-// Caller handles relu backward and bias grad (same as cuDNN path).
+-static void gemm_conv_backward(
+-    PrecisionTensor* weight,
+-    precision_t* saved_input, precision_t* grad_output,
+-    precision_t* wgrad, precision_t* input_grad,
+-    precision_t* col_buf, precision_t* mm_buf,
+-    int B, int IC, int IH, int IW, int OC, int K, int S, int OH, int OW,
+-    cudaStream_t stream
+-) {
+-    int col_rows = B * OH * OW;
+-    int col_cols = IC * K * K;
+-    int total_col = col_rows * col_cols;
+-    int total_out = B * OC * OH * OW;
+-    int spatial = OH * OW;
+-
+-    // Transpose grad_output NCHW -> (B*OH*OW, OC)
+-    nchw_to_rows_kernel<<<grid_size(total_out), BLOCK_SIZE, 0, stream>>>(
+-        grad_output, mm_buf, B, OC, spatial);
+-
+-    // im2col of saved_input
+-    im2col_kernel<<<grid_size(total_col), BLOCK_SIZE, 0, stream>>>(
+-        saved_input, col_buf, B, IC, IH, IW, K, S, OH, OW);
+-
+-    // Weight grad: mm_buf^T (OC, B*OH*OW) @ col_buf (B*OH*OW, IC*K*K) = wgrad (OC, IC*K*K)
+-    PrecisionTensor mm_t  = {.data = mm_buf,  .shape = {col_rows, OC}};
+-    PrecisionTensor col_t = {.data = col_buf, .shape = {col_rows, col_cols}};
+-    PrecisionTensor wg_t  = {.data = wgrad,   .shape = {OC, col_cols}};
+-    puf_mm_tn(&mm_t, &col_t, &wg_t, stream);
+-
+-    // Input grad (optional): mm_buf (B*OH*OW, OC) @ weight (OC, IC*K*K) = col_grad (B*OH*OW, IC*K*K)
+-    if (input_grad) {
+-        puf_mm_nn(&mm_t, weight, &col_t, stream);  // reuse col_buf as col_grad
+-        col2im_kernel<<<grid_size(B * IC * IH * IW), BLOCK_SIZE, 0, stream>>>(
+-            col_buf, input_grad, B, IC, IH, IW, K, S, OH, OW);
+-    }
+-}
+-
+-// ---- NMMO3 encoder structs ----
+-
+-struct NMMO3EncoderWeights {
+-    ConvWeights conv1, conv2;
+-    PrecisionTensor embed_w, proj_w, proj_b;
+-    int obs_size, hidden;
+-};
+-
+-struct NMMO3EncoderActivations {
+-    ConvActivations conv1, conv2;
+-    PrecisionTensor col1, mm1, col2, mm2;  // im2col + matmul scratch buffers
+-    PrecisionTensor multihot, embed_out, concat, out, saved_obs;
+-    PrecisionTensor embed_wgrad, proj_wgrad, proj_bgrad;
+-    FloatTensor embed_wgrad_f;  // float accumulation buffer for scatter-add
+-};
+-
+-static NMMO3EncoderWeights* nmmo3_encoder_create(int obs_size, int hidden) {
+-    NMMO3EncoderWeights* ew = (NMMO3EncoderWeights*)calloc(1, sizeof(NMMO3EncoderWeights));
+-    ew->obs_size = obs_size; ew->hidden = hidden;
+-    conv_init(&ew->conv1, N3_C1_IC, N3_C1_OC, N3_C1_K, N3_C1_S, N3_MAP_H, N3_MAP_W, true);
+-    conv_init(&ew->conv2, N3_C2_IC, N3_C2_OC, N3_C2_K, N3_C2_S, N3_C1_OH, N3_C1_OW, false);
+-    return ew;
+-}
+-
+-// ---- NMMO3 encoder interface ----
+-
+-static PrecisionTensor nmmo3_encoder_forward(void* w, void* activations, PrecisionTensor input, cudaStream_t stream) {
+-    NMMO3EncoderWeights* ew = (NMMO3EncoderWeights*)w;
+-    NMMO3EncoderActivations* a = (NMMO3EncoderActivations*)activations;
+-    int B = input.shape[0];
+-
+-    if (a->saved_obs.data) puf_copy(&a->saved_obs, &input, stream);
+-
+-    cudaMemsetAsync(a->multihot.data, 0, (int64_t)B * N3_MULTIHOT * N3_MAP_H * N3_MAP_W * sizeof(precision_t), stream);
+-    n3_multihot_kernel<<<grid_size(B * N3_MAP_H * N3_MAP_W), BLOCK_SIZE, 0, stream>>>(
+-        a->multihot.data, input.data, B, ew->obs_size);
+-
+-    gemm_conv_forward(&ew->conv1.w, &ew->conv1.b, a->multihot.data, a->conv1.out.data,
+-        a->col1.data, a->mm1.data, B, N3_C1_IC, N3_MAP_H, N3_MAP_W,
+-        N3_C1_OC, N3_C1_K, N3_C1_S, N3_C1_OH, N3_C1_OW, true, stream);
+-    if (a->conv1.saved_input.data)
+-        cudaMemcpyAsync(a->conv1.saved_input.data, a->multihot.data,
+-            (int64_t)B * N3_C1_IC * N3_MAP_H * N3_MAP_W * sizeof(precision_t), cudaMemcpyDeviceToDevice, stream);
+-    gemm_conv_forward(&ew->conv2.w, &ew->conv2.b, a->conv1.out.data, a->conv2.out.data,
+-        a->col2.data, a->mm2.data, B, N3_C2_IC, N3_C1_OH, N3_C1_OW,
+-        N3_C2_OC, N3_C2_K, N3_C2_S, N3_C2_OH, N3_C2_OW, false, stream);
+-    if (a->conv2.saved_input.data)
+-        cudaMemcpyAsync(a->conv2.saved_input.data, a->conv1.out.data,
+-            (int64_t)B * N3_C2_IC * N3_C1_OH * N3_C1_OW * sizeof(precision_t), cudaMemcpyDeviceToDevice, stream);
+-
+-    n3_embedding_kernel<<<grid_size(B * N3_PLAYER), BLOCK_SIZE, 0, stream>>>(
+-        a->embed_out.data, input.data, ew->embed_w.data, B, ew->obs_size);
+-    n3_concat_kernel<<<grid_size(B * N3_CONCAT), BLOCK_SIZE, 0, stream>>>(
+-        a->concat.data, a->conv2.out.data, a->embed_out.data, input.data, B, ew->obs_size);
+-
+-    puf_mm(&a->concat, &ew->proj_w, &a->out, stream);
+-    n3_bias_relu_kernel<<<grid_size(B * ew->hidden), BLOCK_SIZE, 0, stream>>>(
+-        a->out.data, ew->proj_b.data, B * ew->hidden, ew->hidden);
+-    return a->out;
+-}
+-
+-static void nmmo3_encoder_backward(void* w, void* activations, PrecisionTensor grad, cudaStream_t stream) {
+-    NMMO3EncoderWeights* ew = (NMMO3EncoderWeights*)w;
+-    NMMO3EncoderActivations* a = (NMMO3EncoderActivations*)activations;
+-    int B = grad.shape[0], H = ew->hidden;
+-
+-    n3_relu_backward_kernel<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
+-        grad.data, a->out.data, B * H);
+-    bias_grad_kernel<<<H, 256, 0, stream>>>(
+-        a->proj_bgrad.data, grad.data, B, H);
+-    puf_mm_tn(&grad, &a->concat, &a->proj_wgrad, stream);
+-
+-    PrecisionTensor grad_concat = {.data = a->concat.data, .shape = {B, N3_CONCAT}};
+-    puf_mm_nn(&grad, &ew->proj_w, &grad_concat, stream);
+-
+-    n3_concat_backward_conv_kernel<<<grid_size(B * N3_CONV_FLAT), BLOCK_SIZE, 0, stream>>>(
+-        a->conv2.grad.data, grad_concat.data, B);
+-
+-    n3_conv_bias_grad_nchw<<<ew->conv2.OC, 256, 0, stream>>>(
+-        a->conv2.bgrad.data, a->conv2.grad.data,
+-        B, ew->conv2.OC, ew->conv2.OH * ew->conv2.OW);
+-    gemm_conv_backward(&ew->conv2.w, a->conv2.saved_input.data, a->conv2.grad.data,
+-        a->conv2.wgrad.data, a->conv1.grad.data,
+-        a->col2.data, a->mm2.data, B, N3_C2_IC, N3_C1_OH, N3_C1_OW,
+-        N3_C2_OC, N3_C2_K, N3_C2_S, N3_C2_OH, N3_C2_OW, stream);
+-
+-    n3_relu_backward_kernel<<<grid_size(B * ew->conv1.OC * ew->conv1.OH * ew->conv1.OW), BLOCK_SIZE, 0, stream>>>(
+-        a->conv1.grad.data, a->conv1.out.data,
+-        B * ew->conv1.OC * ew->conv1.OH * ew->conv1.OW);
+-    n3_conv_bias_grad_nchw<<<ew->conv1.OC, 256, 0, stream>>>(
+-        a->conv1.bgrad.data, a->conv1.grad.data,
+-        B, ew->conv1.OC, ew->conv1.OH * ew->conv1.OW);
+-    gemm_conv_backward(&ew->conv1.w, a->conv1.saved_input.data, a->conv1.grad.data,
+-        a->conv1.wgrad.data, NULL,
+-        a->col1.data, a->mm1.data, B, N3_C1_IC, N3_MAP_H, N3_MAP_W,
+-        N3_C1_OC, N3_C1_K, N3_C1_S, N3_C1_OH, N3_C1_OW, stream);
+-
+-    // Embedding backward: scatter-add from concat gradient into float buffer, then cast
+-    int embed_n = N3_EMBED_VOCAB * N3_EMBED_DIM;
+-    cudaMemsetAsync(a->embed_wgrad_f.data, 0, embed_n * sizeof(float), stream);
+-    n3_embedding_backward_kernel<<<grid_size(B * N3_PLAYER * N3_EMBED_DIM), BLOCK_SIZE, 0, stream>>>(
+-        a->embed_wgrad_f.data, grad_concat.data, a->saved_obs.data, B, ew->obs_size);
+-    n3_float_to_precision_kernel<<<grid_size(embed_n), BLOCK_SIZE, 0, stream>>>(
+-        a->embed_wgrad.data, a->embed_wgrad_f.data, embed_n);
+-}
+-
+-static void nmmo3_encoder_init_weights(void* w, uint64_t* seed, cudaStream_t stream) {
+-    NMMO3EncoderWeights* ew = (NMMO3EncoderWeights*)w;
+-    conv_init_weights(&ew->conv1, seed, stream);
+-    conv_init_weights(&ew->conv2, seed, stream);
+-    auto init2d = [&](PrecisionTensor& t, int rows, int cols, float gain) {
+-        PrecisionTensor wt = {.data = t.data, .shape = {rows, cols}};
+-        puf_kaiming_init(&wt, gain, (*seed)++, stream);
+-    };
+-    puf_normal_init(&ew->embed_w, 1.0f, (*seed)++, stream);
+-    init2d(ew->proj_w, ew->hidden, N3_CONCAT, 1.0f);
+-    cudaMemsetAsync(ew->proj_b.data, 0, numel(ew->proj_b.shape) * sizeof(precision_t), stream);
+-}
+-
+-static void nmmo3_encoder_reg_params(void* w, Allocator* alloc) {
+-    NMMO3EncoderWeights* ew = (NMMO3EncoderWeights*)w;
+-    conv_reg_params(&ew->conv1, alloc);
+-    conv_reg_params(&ew->conv2, alloc);
+-    ew->embed_w = {.shape = {N3_EMBED_VOCAB, N3_EMBED_DIM}};
+-    ew->proj_w  = {.shape = {ew->hidden, N3_CONCAT}};
+-    ew->proj_b  = {.shape = {ew->hidden}};
+-    alloc_register(alloc,&ew->embed_w);
+-    alloc_register(alloc,&ew->proj_w);  alloc_register(alloc,&ew->proj_b);
+-}
+-
+-static void nmmo3_encoder_reg_train(void* w, void* activations, Allocator* acts, Allocator* grads, int B_TT) {
+-    NMMO3EncoderWeights* ew = (NMMO3EncoderWeights*)w;
+-    NMMO3EncoderActivations* a = (NMMO3EncoderActivations*)activations;
+-    *a = {};
+-    a->multihot = {.shape = {B_TT, N3_MULTIHOT * N3_MAP_H * N3_MAP_W}};
+-    alloc_register(acts,&a->multihot);
+-    // Conv1 buffers
+-    a->conv1.out         = {.shape = {B_TT * N3_C1_OC * N3_C1_OH * N3_C1_OW}};
+-    a->conv1.grad        = {.shape = {B_TT * N3_C1_OC * N3_C1_OH * N3_C1_OW}};
+-    a->conv1.saved_input = {.shape = {B_TT * N3_C1_IC * N3_MAP_H * N3_MAP_W}};
+-    a->conv1.wgrad       = {.shape = {N3_C1_OC, N3_C1_IC * N3_C1_K * N3_C1_K}};
+-    a->conv1.bgrad       = {.shape = {N3_C1_OC}};
+-    alloc_register(acts,&a->conv1.out); alloc_register(acts,&a->conv1.grad); alloc_register(acts,&a->conv1.saved_input);
+-    alloc_register(grads,&a->conv1.wgrad); alloc_register(grads,&a->conv1.bgrad);
+-    a->col1 = {.shape = {B_TT * N3_C1_OH * N3_C1_OW, N3_C1_IC * N3_C1_K * N3_C1_K}};
+-    a->mm1  = {.shape = {B_TT * N3_C1_OH * N3_C1_OW, N3_C1_OC}};
+-    alloc_register(acts,&a->col1); alloc_register(acts,&a->mm1);
+-    // Conv2 buffers
+-    a->conv2.out         = {.shape = {B_TT * N3_C2_OC * N3_C2_OH * N3_C2_OW}};
+-    a->conv2.grad        = {.shape = {B_TT * N3_C2_OC * N3_C2_OH * N3_C2_OW}};
+-    a->conv2.saved_input = {.shape = {B_TT * N3_C2_IC * N3_C1_OH * N3_C1_OW}};
+-    a->conv2.wgrad       = {.shape = {N3_C2_OC, N3_C2_IC * N3_C2_K * N3_C2_K}};
+-    a->conv2.bgrad       = {.shape = {N3_C2_OC}};
+-    alloc_register(acts,&a->conv2.out); alloc_register(acts,&a->conv2.grad); alloc_register(acts,&a->conv2.saved_input);
+-    alloc_register(grads,&a->conv2.wgrad); alloc_register(grads,&a->conv2.bgrad);
+-    a->col2 = {.shape = {B_TT * N3_C2_OH * N3_C2_OW, N3_C2_IC * N3_C2_K * N3_C2_K}};
+-    a->mm2  = {.shape = {B_TT * N3_C2_OH * N3_C2_OW, N3_C2_OC}};
+-    alloc_register(acts,&a->col2); alloc_register(acts,&a->mm2);
+-    a->embed_out = {.shape = {B_TT, N3_PLAYER_EMBED}};
+-    a->concat    = {.shape = {B_TT, N3_CONCAT}};
+-    a->out       = {.shape = {B_TT, ew->hidden}};
+-    a->saved_obs = {.shape = {B_TT, ew->obs_size}};
+-    alloc_register(acts,&a->embed_out); alloc_register(acts,&a->concat);
+-    alloc_register(acts,&a->out);       alloc_register(acts,&a->saved_obs);
+-    a->embed_wgrad = {.shape = {N3_EMBED_VOCAB, N3_EMBED_DIM}};
+-    a->embed_wgrad_f = {.shape = {N3_EMBED_VOCAB, N3_EMBED_DIM}};
+-    a->proj_wgrad  = {.shape = {ew->hidden, N3_CONCAT}};
+-    a->proj_bgrad  = {.shape = {ew->hidden}};
+-    alloc_register(grads,&a->embed_wgrad);
+-    alloc_register(acts,&a->embed_wgrad_f);
+-    alloc_register(grads,&a->proj_wgrad);  alloc_register(grads,&a->proj_bgrad);
+-}
+-
+-static void nmmo3_encoder_reg_rollout(void* w, void* activations, Allocator* alloc, int B) {
+-    NMMO3EncoderWeights* ew = (NMMO3EncoderWeights*)w;
+-    NMMO3EncoderActivations* a = (NMMO3EncoderActivations*)activations;
+-    a->multihot = {.shape = {B, N3_MULTIHOT * N3_MAP_H * N3_MAP_W}};
+-    alloc_register(alloc,&a->multihot);
+-    a->conv1.out = {.shape = {B * N3_C1_OC * N3_C1_OH * N3_C1_OW}};
+-    alloc_register(alloc,&a->conv1.out);
+-    a->col1 = {.shape = {B * N3_C1_OH * N3_C1_OW, N3_C1_IC * N3_C1_K * N3_C1_K}};
+-    a->mm1  = {.shape = {B * N3_C1_OH * N3_C1_OW, N3_C1_OC}};
+-    alloc_register(alloc,&a->col1); alloc_register(alloc,&a->mm1);
+-    a->conv2.out = {.shape = {B * N3_C2_OC * N3_C2_OH * N3_C2_OW}};
+-    alloc_register(alloc,&a->conv2.out);
+-    a->col2 = {.shape = {B * N3_C2_OH * N3_C2_OW, N3_C2_IC * N3_C2_K * N3_C2_K}};
+-    a->mm2  = {.shape = {B * N3_C2_OH * N3_C2_OW, N3_C2_OC}};
+-    alloc_register(alloc,&a->col2); alloc_register(alloc,&a->mm2);
+-    a->embed_out = {.shape = {B, N3_PLAYER_EMBED}};
+-    a->concat    = {.shape = {B, N3_CONCAT}};
+-    a->out       = {.shape = {B, ew->hidden}};
+-    alloc_register(alloc,&a->embed_out); alloc_register(alloc,&a->concat); alloc_register(alloc,&a->out);
+-}
+-
+-static void* nmmo3_encoder_create_weights(void* self) {
+-    Encoder* e = (Encoder*)self;
+-    return nmmo3_encoder_create(e->in_dim, e->out_dim);
+-}
+-static void nmmo3_encoder_free_weights(void* weights) { free(weights); }
+-static void nmmo3_encoder_free_activations(void* activations) { free(activations); }
+-
+-// Override encoder vtable for known ocean environments. No-op for unknown envs.
+ static void create_custom_encoder(const std::string& env_name, Encoder* enc) {
+-    if (env_name == "nmmo3") {
+-        *enc = Encoder{
+-            .forward = nmmo3_encoder_forward,
+-            .backward = nmmo3_encoder_backward,
+-            .init_weights = nmmo3_encoder_init_weights,
+-            .reg_params = nmmo3_encoder_reg_params,
+-            .reg_train = nmmo3_encoder_reg_train,
+-            .reg_rollout = nmmo3_encoder_reg_rollout,
+-            .create_weights = nmmo3_encoder_create_weights,
+-            .free_weights = nmmo3_encoder_free_weights,
+-            .free_activations = nmmo3_encoder_free_activations,
+-            .in_dim = enc->in_dim, .out_dim = enc->out_dim,
+-            .activation_size = sizeof(NMMO3EncoderActivations),
+-        };
+-    } else if (env_name == "nethack") {
+-        create_nethack_encoder(enc);
+-    }
++    if (env_name != "ptcg") return;
++    enc->forward = ptcg_enc_forward;
++    enc->backward = ptcg_enc_backward;
++    enc->init_weights = ptcg_enc_init_weights;
++    enc->reg_params = ptcg_enc_reg_params;
++    enc->reg_train = ptcg_enc_reg_train;
++    enc->reg_rollout = ptcg_enc_reg_rollout;
++    enc->create_weights = ptcg_enc_create_weights;
++    enc->free_weights = ptcg_enc_free_weights;
++    enc->free_activations = ptcg_enc_free_activations;
++    // in_dim = obs (10944); out_dim = fused logits+value = hidden_size (65)
++    enc->activation_size = sizeof(PtcgActX);
+ }
+ 
+ static void create_custom_decoder(const std::string& env_name, Decoder* dec) {
+-    if (env_name == "nethack") create_nethack_decoder(dec);
++    if (env_name != "ptcg") return;
++    dec->forward = ptcg_dec_forward;
++    dec->backward = ptcg_dec_backward;
++    dec->init_weights = ptcg_dec_init_weights;
++    dec->reg_params = ptcg_dec_reg_params;
++    dec->reg_train = ptcg_dec_reg_train;
++    dec->reg_rollout = ptcg_dec_reg_rollout;
++    dec->create_weights = ptcg_dec_create_weights;
++    dec->free_weights = ptcg_dec_free_weights;
++    dec->free_activations = ptcg_dec_free_activations;
++    dec->activation_size = (int)sizeof(PtcgDecActs);
+ }
++
++static void create_custom_network(const std::string& env_name, Network* net) {
++    if (env_name != "ptcg") return;
++    net->forward = ptcg_net_forward;
++    net->forward_train = ptcg_net_forward_train;
++    net->backward = ptcg_net_backward;
++    net->init_weights = ptcg_net_init_weights;
++    net->reg_params = ptcg_net_reg_params;
++    net->reg_train = ptcg_net_reg_train;
++    net->reg_rollout = ptcg_net_reg_rollout;
++    net->create_weights = ptcg_net_create_weights;
++    net->free_weights = ptcg_net_free_weights;
++    net->free_activations = ptcg_net_free_activations;
++}

@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite it as below."
+type: software
+title: "Pokémon TCG AI Battle: native RL trainer and deck lab"
+authors:
+  - family-names: Chakraborty
+    given-names: Dipam
+year: 2026
+license: MIT
+abstract: >-
+  Self-play PPO trainer (C environment, CUDA policy network, patched PufferLib
+  native trainer), Python runtime and deck-lab harness from Team Unown
+  Gradiant's entry to the Kaggle competition "The Pokémon Company - PTCG AI
+  Battle Challenge".

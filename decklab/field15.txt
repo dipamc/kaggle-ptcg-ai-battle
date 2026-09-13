@@ -1,0 +1,17 @@
+# <field share> <deck name in decks/pool>
+
+0.28788 marnie_s_grimmsnarl_ex_spikemuth_gym__04
+0.13833 dudunsparce_mega_lopunny_ex_hand_trimmer__01
+0.10038 alakazam_enhanced_hammer__03
+0.09029 mega_lucario_ex_hariyama_premium_power_pro__01
+0.07014 dudunsparce_mega_lopunny_ex_spiky_energy__01
+0.06149 teal_mask_ogerpon_ex_energy_search__01
+0.04380 dragapult_ex_crushing_hammer__01
+0.03756 crustle_spiky_energy__02
+0.02941 mega_kangaskhan_ex_meowth_ex_area_zero_underde__02
+0.02824 teal_mask_ogerpon_ex_crushing_hammer__01
+0.02578 slowking_academy_at_night__01
+0.02477 marnie_s_grimmsnarl_ex_spikemuth_gym__03
+0.02137 mega_kangaskhan_ex_meowth_ex_area_zero_underde__01
+0.02120 dudunsparce_mega_lopunny_ex_spiky_energy__02
+0.01936 thwackey_dipplin_festival_grounds__02

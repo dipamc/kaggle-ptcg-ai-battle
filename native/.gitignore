@@ -1,0 +1,6 @@
+build/
+parity_stream.jsonl
+parity_rows.bin
+ptcg_tables.bin
+*.o
+*.so

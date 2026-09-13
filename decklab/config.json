@@ -1,0 +1,50 @@
+{
+  "arena": {
+    "host": "local",
+    "runner": "batched",
+    "workers_ab": 8,
+    "device": "cpu",
+    "python": null,
+    "repo": null,
+    "arena_dir": null
+  },
+  "arena_probe": {
+    "host": "local",
+    "runner": "batched",
+    "workers_probe": 8,
+    "device": "cpu",
+    "ckpt": "experiments/train-native_<run>/model_<epoch>.pt",
+    "heads": 8
+  },
+  "ckpt_primary": "experiments/train-native_<run>/model_<epoch>.pt",
+  "ckpt_replicate": "experiments/train-native_<run>/model_<earlier-epoch>.pt",
+  "heads": 8,
+  "device": "cpu",
+  "temp": 0.0,
+  "games_targeted_per_opp": 200,
+  "games_field_per_opp": 70,
+  "field_gauntlet": "decklab/field30.txt",
+  "max_swaps": 8,
+  "replication_required": false,
+  "accept": {
+    "targeted_min_delta": 0.05,
+    "targeted_min_z": 2.0,
+    "field_noninferiority_z": 2.0
+  },
+  "screen": {
+    "games_targeted_per_opp": 100,
+    "games_field_per_opp": 60,
+    "field_gauntlet": "decklab/field15.txt"
+  },
+  "matrices": {
+    "primary": {
+      "paths": [
+        "experiments/native-<run>/deckmat"
+      ],
+      "names": null,
+      "epoch_min": null
+    }
+  },
+  "default_matrix": "primary",
+  "evaluator_pool_names": null
+}

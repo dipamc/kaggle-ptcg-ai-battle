@@ -1,0 +1,43 @@
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+
+# competition data (fetch from Kaggle, see data/README.md)
+data/cg/
+data/EN_Card_Data.csv
+data/carddb.json
+data/embed_texts.json
+data/embed_vectors_te3l.npz
+data/pool_names.txt
+
+# optional deck-lab input (docs/decklab.md)
+data/deck_implied.csv
+
+# generated / run artifacts
+native/build/
+native/puffer_ptcg/_C*.so
+native/*.bin
+native/parity_stream*.jsonl
+native/parity_rows.bin
+experiments/
+runs/
+wandb/
+opponents/*/
+!opponents/README.md
+
+# decklab working state
+decklab/packs/
+decklab/jobs/
+decklab/staging/
+decklab/staged/
+decklab/results/base_cache.jsonl
+decklab/LEDGER.jsonl
+decklab/notes.jsonl
+
+# submission: the SDK and card sheet must be added from Kaggle before packing
+submission/cg/
+submission/EN_Card_Data.csv
+submission/data/EN_Card_Data.csv
+submission/submission.tar.gz
+*.tar.gz

@@ -1,0 +1,31 @@
+# Checks that need neither the competition SDK nor a GPU. The C env tests
+# (make -C native test) and the CUDA parity tools need data/cg/ and cannot
+# run here; see docs/training.md.
+name: checks
+on: [push, pull_request]
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Python syntax
+        run: python -m compileall -q agent ptcg tools native submission
+      - name: Deck files are 60 lines
+        run: |
+          bad=0
+          for f in decks/pool/*.csv decks/pool_alt/*.csv submission/deck.csv; do
+            n=$(wc -l < "$f")
+            [ "$n" -eq 60 ] || { echo "$f: $n lines"; bad=1; }
+          done
+          exit $bad
+      - name: Vendored PufferLib equals upstream c5d3c63 plus the patch
+        run: |
+          git clone -q --filter=blob:none --no-checkout https://github.com/PufferAI/PufferLib.git /tmp/pufferlib
+          git -C /tmp/pufferlib checkout -q c5d3c637446047a6efbcaa74c039c5295d201ab0
+          patch -d /tmp/pufferlib -p1 < native/patches/pufferlib-c5d3c63.patch
+          for f in pufferlib.cu bindings.cu muon.cu kernels.cu vecenv.h ocean.cu models.cu tensor.h; do
+            diff -q "/tmp/pufferlib/src/$f" "native/src/$f"
+          done

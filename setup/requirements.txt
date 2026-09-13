@@ -1,0 +1,19 @@
+# Training-host deps. torch bundles its own CUDA runtime, but pufferlib 3.0
+# compiles a torch CUDA extension against the system nvcc at install time,
+# so torch's CUDA major must match nvcc. The default-index torch 2.13 is
+# CUDA 13; on a CUDA 12.x host (driver < 580) install torch from the cu128
+# index first, then pufferlib without build isolation, then this file:
+#   uv pip install "torch<2.13" --index-url https://download.pytorch.org/whl/cu128
+#   uv pip install --no-build-isolation pufferlib==3.0.0
+#   sed 's/^torch==.*/torch<2.13/' setup/requirements.txt > /tmp/req_cu128.txt
+#   PTCG_REQUIREMENTS=/tmp/req_cu128.txt bash setup/bootstrap.sh
+# numpy<2 is what pufferlib 3.0 resolves to.
+torch==2.13.0
+numpy==1.26.4
+tensorboard==2.21.0
+pufferlib==3.0.0
+wandb==0.28.1
+gymnasium          # pufferlib 3.0 env base (ptcg/rl/env.py)
+pybind11           # native/build_native.sh
+# optional: checkpoint uploads (--hf-repo / HF_REPO)
+# huggingface_hub
